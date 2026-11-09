@@ -15,7 +15,7 @@ rem rslink.cpp: the bridge's ReShade link (C++, ReShade's add-on API headers in 
 rem dinput8.rc: the version resource (Properties > Details)
 "%WINDRES%" -O coff -o build\dinput8_res.o dinput8.rc || exit /b 1
 rem not stripped (-s): the stripped 2.0 DLL was flagged by Microsoft's cloud ML (Wacatac), unstripped passes (VirusTotal 2026-11-02)
-"%CC%" -O2 -Wall -Wextra -shared -static -Wl,--no-insert-timestamp -o build\dinput8.dll proxy.c tilescan.c x87fix.c sortfix.c diag.c update.c fileio.c strfix.c attrcache.c logtrim.c bridgeprobe.c fgbridge.c fgpanel.c r2motion.c build\rslink.o build\dinput8_res.o dinput8.def -lgdi32 || exit /b 1
+"%CC%" -O2 -Wall -Wextra -shared -static -Wl,--no-insert-timestamp -o build\dinput8.dll proxy.c tilescan.c x87fix.c sortfix.c diag.c update.c fileio.c strfix.c attrcache.c logtrim.c memwatch.c scriptext.c plugins.c fpslog.c bridgeprobe.c fgbridge.c fgpanel.c r2motion.c build\rslink.o build\dinput8_res.o dinput8.def -lgdi32 -lpsapi || exit /b 1
 echo built build\dinput8.dll
 
 if /i not "%~1"=="test" exit /b 0
@@ -23,16 +23,16 @@ if "%~2"=="" (
     echo usage: build.bat test "path\to\empire.retail.dll"
     exit /b 1
 )
-"%CC%" -O2 -Wall -static -o build\tilescan_test.exe tests\tilescan_test.c tilescan.c || exit /b 1
+"%CC%" -O2 -Wall -static -o build\tilescan_test.exe tests\tilescan_test.c tilescan.c fpslog.c || exit /b 1
 "%CC%" -O2 -Wall -static -o build\logtrim_test.exe tests\logtrim_test.c logtrim.c || exit /b 1
-for %%T in (x87fix sort diag selfupd lateload fileio strfix attrcache) do (
+for %%T in (x87fix sort diag selfupd lateload fileio strfix attrcache memwatch fpslog) do (
     "%CC%" -O2 -Wall -static -o build\%%T_test.exe tests\%%T_test.c || exit /b 1
 )
 for %%T in (tilescan x87fix sort strfix) do (
     echo == %%T
     build\%%T_test.exe "%~2" || (echo %%T test FAILED & exit /b 1)
 )
-for %%T in (diag selfupd fileio attrcache logtrim) do (
+for %%T in (diag selfupd fileio attrcache logtrim memwatch fpslog) do (
     echo == %%T
     build\%%T_test.exe || (echo %%T test FAILED & exit /b 1)
 )
@@ -43,10 +43,18 @@ rem the frame bridge (needs a D3D11 GPU): the glue with fgbridge.c stubbed, the 
 echo == bridgelive
 build\bridgelive_test.exe || (echo bridgelive test FAILED & exit /b 1)
 build\bridgelive_test.exe addon || (echo bridgelive add-on test FAILED & exit /b 1)
+build\bridgelive_test.exe startfail || (echo bridgelive start-failed test FAILED & exit /b 1)
+build\bridgelive_test.exe startfail nod3d12 || (echo bridgelive no-12_0 test FAILED & exit /b 1)
 echo == r2motion
 build\r2motion_test.exe || (echo r2motion test FAILED & exit /b 1)
 echo == jitedge
 build\jitedge_test.exe || (echo jitedge test FAILED & exit /b 1)
 echo == lateload
 build\lateload_test.exe "%~dp0build\dinput8.dll" "%~2" || (echo lateload test FAILED & exit /b 1)
+echo == plugins
+"%CC%" -O2 -Wall -shared -static -o build\plugin_dummy.dll tests\plugin_dummy.c || exit /b 1
+"%CC%" -O2 -Wall -static -o build\plugins_test.exe tests\plugins_test.c plugins.c || exit /b 1
+pushd build
+.\plugins_test.exe plugin_dummy.dll || (popd & echo plugins test FAILED & exit /b 1)
+popd
 echo all tests passed

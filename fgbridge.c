@@ -265,7 +265,7 @@ static int amd_files(const wchar_t *helper_exe) {
 }
 
 // the helper: helper64.exe bridge <pid> <streamline dir> <log dir>, killed with this process (job object); waits up to
-// 10 s for it to be ready (fgb_start, fgb_restart)
+// 30 s for it to be ready (fgb_start, fgb_restart)
 static int launch_helper(void) {
     HANDLE job = CreateJobObjectW(NULL, NULL);
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {0};
@@ -279,16 +279,26 @@ static int launch_helper(void) {
     CloseHandle(pi.hThread);
     g_helper = pi.hProcess;
     g_gen++;
-    // 10 s by the clock (Sleep(1) lasts 15.6 ms at Windows' default timer, so counting sleeps could take ~2.5 min)
-    for (ULONGLONG t0 = GetTickCount64(); !g_sh->helper_ok && !g_sh->error && GetTickCount64() - t0 < 10000 &&
-                                          WaitForSingleObject(g_helper, 0) == WAIT_TIMEOUT;)
+    // 30 s by the clock (Sleep(1) lasts 15.6 ms at Windows' default timer, so counting sleeps could take ~2.5 min).
+    // Was 10 s: an Attila player's RTX 2060 laptop needed 11-13 s (Streamline alone ~5.6 s; Attila AGENT_LOG 217)
+    ULONGLONG t0 = GetTickCount64();
+    while (!g_sh->helper_ok && !g_sh->error && GetTickCount64() - t0 < 30000 && WaitForSingleObject(g_helper, 0) == WAIT_TIMEOUT)
         Sleep(1);
+    unsigned ms = (unsigned)(GetTickCount64() - t0);
     if (!g_sh->helper_ok) {   // a slow start must not leave the helper running with the game's window
+        DWORD code = STILL_ACTIVE;
+        GetExitCodeProcess(g_helper, &code);
         TerminateProcess(g_helper, 1);
         WaitForSingleObject(g_helper, 1000);
-        g_log("frame bridge: helper did not start Streamline - off (see its log)");
+        if (code != STILL_ACTIVE)
+            g_log("frame bridge: helper did not start Streamline - it stopped after %u ms (exit code %lu) - off (see its log)", ms, code);
+        else if (g_sh->error)
+            g_log("frame bridge: helper did not start Streamline - it reported an error after %u ms - off (see its log)", ms);
+        else
+            g_log("frame bridge: helper did not start Streamline - not ready after %u s, stopped - off (see its log)", ms / 1000);
         return 0;
     }
+    g_log("frame bridge: helper ready after %u ms", ms);
     return 1;
 }
 
@@ -740,6 +750,22 @@ void fgb_gpu_caps(int *dlss_sr, int *dlss_fg) {
     if (g_sh && g_sh->helper_ok && g_sh->fg_max && fgb_fg_backend_nv()) *dlss_fg = 1;
 }
 const wchar_t *fgb_gpu_name(void) { return g_gpu_name; }
+
+// After a failed start only (it loads D3D12 into the 32-bit game): 0 when the game's card has no Direct3D 12 feature
+// level 12_0, which the helper's device needs for DLSS and AMD FSR (NVIDIA Kepler / early Maxwell and older; an Attila
+// player's helper log ended at D3D12CreateDevice 0x887a0004, 2026-11-02). No device is made (NULL out pointer: a test only).
+int fgb_d3d12_ok(ID3D11Device *dev) {
+    static const GUID iid_dxgi_device = {0x54ec77fa, 0x1377, 0x44e6, {0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c}};
+    static const GUID iid_d3d12_device = {0x189819f1, 0x1db6, 0x4b57, {0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7}};
+    HMODULE m = LoadLibraryExA("d3d12.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    PFN_D3D12_CREATE_DEVICE create = m ? (PFN_D3D12_CREATE_DEVICE)(void *)GetProcAddress(m, "D3D12CreateDevice") : NULL;
+    IDXGIDevice *xd = NULL; IDXGIAdapter *ad = NULL;
+    if (!create || FAILED(ID3D11Device_QueryInterface(dev, &iid_dxgi_device, (void **)&xd))) return !create ? 0 : 1;   // no D3D12 at all: not ok
+    HRESULT hr = SUCCEEDED(IDXGIDevice_GetAdapter(xd, &ad)) ? create((IUnknown *)ad, D3D_FEATURE_LEVEL_12_0, &iid_d3d12_device, NULL) : S_OK;
+    if (ad) IDXGIAdapter_Release(ad);
+    IDXGIDevice_Release(xd);
+    return SUCCEEDED(hr);
+}
 // This frame's depth copy for DLSS and motion vectors (camera, then the per-object pass): once per frame, at the first
 // call - fgb_motion_vectors() (another mod's early effects, right after the scene's geometry) or the HUD-less point.
 // Returns 1 if they are made. Before writing, the GPU waits until the helper has read the previous frame's.
@@ -1139,6 +1165,9 @@ static void log_thread_stack(DWORD tid, const char *what) {
     }
     g_log("frame bridge watchdog: %s; main thread at%s", what, n ? out : " ? (no context)");
 }
+// a watchdog stopping its helper vs an F11 switch's g_gen++: the switch must not replace the helper and its fences in the
+// middle (the old watchdog would then release the new helper's fences; Attila review 3 #2)
+static SRWLOCK g_gen_lock = SRWLOCK_INIT;
 static DWORD WINAPI watchdog(void *arg) {
     unsigned gen = (unsigned)(UINT_PTR)arg;
     uint32_t done0 = 0, n0 = 0;
@@ -1153,6 +1182,8 @@ static DWORD WINAPI watchdog(void *arg) {
         done0 = d; n0 = n;
         if (still == 20 && g_present_tid) log_thread_stack(g_present_tid, "the game has not presented for 5 s");
         if (stuck == 12) {
+            AcquireSRWLockExclusive(&g_gen_lock);
+            if (gen != g_gen) { ReleaseSRWLockExclusive(&g_gen_lock); break; }   // a switch took over meanwhile
             char what[160];
             snprintf(what, sizeof what, "the helper has finished nothing for 3 s (frames handed over %u, finished %u, DLSS SR %u/%u) - helper stopped, DLSS off",
                      f, d, g_sh->sr_frames, g_sh->sr_done);
@@ -1161,6 +1192,7 @@ static DWORD WINAPI watchdog(void *arg) {
             if (g_present_tid) log_thread_stack(g_present_tid, what);   // where it waits, before it can go on
             else g_log("frame bridge watchdog: %s", what);
             release_gpu_waits();   // the game's GPU goes on; it may have been all that held the main thread
+            ReleaseSRWLockExclusive(&g_gen_lock);
             break;
         }
     }
@@ -1182,15 +1214,27 @@ int fgb_fences_lost(void) {
 }
 int fgb_restart(unsigned tech) {
     if (!fgb_can_restart()) return 0;
+    // the switch blocks the game's window until the new helper is up (seconds): no "Not Responding" ghost window a player
+    // would close. Only from a switch: it lasts the session, and real freezes keep Windows' prompt otherwise.
+    // shortcut: still a blocking wait; a non-blocking switch needs an in-game test
+    DisableProcessWindowsGhosting();
     uint32_t f = __atomic_load_n(&g_sh->frames, __ATOMIC_ACQUIRE);
-    for (ULONGLONG t0 = GetTickCount64(); __atomic_load_n(&g_sh->done, __ATOMIC_ACQUIRE) < f && GetTickCount64() - t0 < 2000;) Sleep(1);
+    // this runs inside the game's Present: short waits (Attila review F1); a frozen old helper is killed after 2 s
+    for (ULONGLONG t0 = GetTickCount64(); __atomic_load_n(&g_sh->done, __ATOMIC_ACQUIRE) < f && GetTickCount64() - t0 < 1000;) Sleep(1);
     ID3D11DeviceContext_Flush(g_ctx);
+    AcquireSRWLockExclusive(&g_gen_lock);   // waits while the old watchdog is stopping that helper (then it is gone here)
     g_gen++;   // the watchdog of the old helper ends
+    ReleaseSRWLockExclusive(&g_gen_lock);
     __atomic_store_n(&g_sh->frames, FGB_QUIT, __ATOMIC_RELEASE);
     SetEvent(g_wake);
     SetEvent(g_wake2);
-    if (WaitForSingleObject(g_helper, 5000) == WAIT_TIMEOUT) TerminateProcess(g_helper, 1);
+    // a killed helper is gone before its fences' names are made again (make_fences; else "switch fences not made")
+    if (WaitForSingleObject(g_helper, 2000) == WAIT_TIMEOUT) { TerminateProcess(g_helper, 1); WaitForSingleObject(g_helper, 1000); }
     CloseHandle(g_helper);
+    g_helper = NULL;   // a failure below must not leave fgb_stop waiting on a closed handle
+    // GPU waits queued on the old helper's fences (it was late) would never complete once make_fences replaces them:
+    // the game's GPU would hang; the watchdog and fgb_stop do the same
+    if (__atomic_load_n(&g_sh->done, __ATOMIC_ACQUIRE) < f) release_gpu_waits();
     // a fresh window for the new helper's swapchain: on the game window Windows refuses another process' swapchain once the
     // old helper had one there (0x80070005 for a plain flip swapchain too, AGENT_LOG 166). A child over the client area,
     // click-through like the fallback's. shortcut: it keeps its size if the game window changes size; follow WM_SIZE if a
@@ -1225,6 +1269,7 @@ int fgb_restart(unsigned tech) {
     return 1;
 }
 
+void fgb_release_gpu(void);
 void fgb_stop(void) {
     static int stopped;
     if (!g_sh || stopped) return;
@@ -1235,6 +1280,22 @@ void fgb_stop(void) {
     if (g_helper && WaitForSingleObject(g_helper, 5000) == WAIT_TIMEOUT) TerminateProcess(g_helper, 1);   // frozen: not left on the window
     g_live = 0;
     release_gpu_waits();
+    fgb_release_gpu();
+}
+// The bridge's textures (~400 MB at 4K) are not used again this session: give the video memory back for the fallback
+// (Attila review F2 / round 2 R1-R2). Also after a start that failed. The textures are shared through NT handles: those
+// are closed too, or the memory stays allocated. The fill and mask passes check their shaders, everything else fgb_active().
+void fgb_release_gpu(void) {
+    g_live = 0;
+    for (int i = 3; i < 9; i++) if (g_handles[i]) { CloseHandle(g_handles[i]); g_handles[i] = NULL; }
+    if (g_react_handle) { CloseHandle(g_react_handle); g_react_handle = NULL; }
+    g_sharp_cs = NULL; g_fill_cs = NULL; g_react_cs = NULL;
+#define REL(p) do { if (p) { IUnknown_Release((IUnknown *)(p)); (p) = NULL; } } while (0)
+    REL(g_d32_uav); REL(g_mv_uav); REL(g_sharp_uav); REL(g_srout_srv[0]); REL(g_srout_srv[1]); REL(g_dcopy_srv);
+    REL(g_final); REL(g_hud); REL(g_d32); REL(g_mv); REL(g_srout[0]); REL(g_srout[1]); REL(g_dcopy); REL(g_sharp);
+    REL(g_mvcam_srv); REL(g_mvobj_srv); REL(g_mvcam); REL(g_mvobj);
+    REL(g_react_uav); REL(g_react_rtv); REL(g_opq_srv); REL(g_cur_srv); REL(g_react); REL(g_opq); REL(g_cur); REL(g_react_hdr);
+#undef REL
 }
 // n bytes of a loaded DLL as its file on disk has them (addr inside the DLL), and the file's own base address (the
 // loaded header's ImageBase is rewritten to where the DLL is loaded). 0 if anything does not fit.

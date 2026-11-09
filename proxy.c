@@ -13,6 +13,12 @@
 
 int install_tilescan(HMODULE m, int mode, int fpslog, void (*log)(const char *fmt, ...));  // tilescan.c
 extern void (*g_frame_check)(void);                                                    // tilescan.c
+int install_memwatch(HMODULE m, void (*trim)(void), void (*log)(const char *fmt, ...));  // memwatch.c
+int install_scriptext(HMODULE m, const wchar_t *dir, void (*log)(const char *fmt, ...));  // scriptext.c
+void scriptext_frame(void);                                                             // scriptext.c
+int load_plugins(const wchar_t *dir, void (*log)(const char *fmt, ...));               // plugins.c
+int install_fpslog(const wchar_t *dir);                                                 // fpslog.c
+static int g_scriptext_on, g_late_install;   // late: install_all runs from the DLL load notification, not DllMain
 int install_x87fix(HMODULE m, void (*log)(const char *fmt, ...));                      // x87fix.c (from the Attila mod)
 void x87fix_frame(void);                                                               // x87fix.c
 int install_sortfix(HMODULE m, void (*log)(const char *fmt, ...));                     // sortfix.c (from the Attila mod)
@@ -45,6 +51,7 @@ static HMODULE g_self;
 // Per frame on the main thread (from the tile-scan entry hook).
 static void frame_checks(void) {
     if (g_x87_on) x87fix_frame();
+    if (g_scriptext_on) scriptext_frame();
 #ifdef PROFILING
     if (g_probes_on) probes_frame();
 #endif
@@ -65,17 +72,18 @@ static void log_header(void) {
 }
 
 static void wlog(const char *fmt, ...) {
-    FILE *f = _wfopen(g_log_path, L"a");
-    if (!f) return;
+    if (!g_log_path[0]) return;
+    char buf[4096];
     SYSTEMTIME t;
     GetLocalTime(&t);
-    fprintf(f, "[%02d:%02d:%02d.%03d] ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    int n = snprintf(buf, sizeof buf, "[%02d:%02d:%02d.%03d] ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
     va_list a;
     va_start(a, fmt);
-    vfprintf(f, fmt, a);
+    int m = vsnprintf(buf + n, sizeof buf - n - 2, fmt, a);
     va_end(a);
-    fputc('\n', f);
-    fclose(f);
+    n += m < 0 ? 0 : m < (int)sizeof buf - n - 2 ? m : (int)sizeof buf - n - 3;   // a longer line is cut
+    buf[n++] = '\r'; buf[n++] = '\n';   // as the text-mode file had it
+    log_append(g_log_path, buf, n);     // logtrim.h: one atomic append, no file open per line (Attila round 2)
 }
 
 // ---- dinput8 forwarding (the real DLL is loaded on first use, never inside DllMain)
@@ -169,8 +177,10 @@ static const char g_ini_defaults[] =
     "[mod]\r\n"
     "; copy a newer version from the Steam Workshop into the game folder at startup\r\n"
     "self_update=1\r\n"
-    "; record crashes in rome2fix.log (EXCEPTION lines)\r\n"
+    "; record crashes in rome2fix.log (EXCEPTION lines, a crash_*.dmp file for the first one)\r\n"
     "crash_logging=1\r\n"
+    "; load other mods' DLLs from the plugins folder in the game folder (any name, e.g. plugins\\smoke.dll)\r\n"
+    "plugins=1\r\n"
     "\r\n"
     "; The DLSS add-on has its own settings: FrameBridge\\settings.txt (F11 in game).\r\n";
 
@@ -205,6 +215,7 @@ static void install_all(HMODULE m) {
 #define OFF(key, file) (!INI(L"fixes", key) || PRESENT(file))
     g_crash_logging = INI(L"mod", L"crash_logging");
     diag_startup(m, g_log_path, wlog);  // version, process, game build, system, settings; crash records
+    if (g_crash_logging) install_memwatch(m, NULL, wlog);   // failed file maps / allocations and low address space logged
     if (INI(L"mod", L"self_update"))
         update_check(g_self, wlog);     // a newer Workshop copy replaces this DLL for the next launch
     else
@@ -221,6 +232,12 @@ static void install_all(HMODULE m) {
 #endif
     // The entry hook of the tile scan is also the per-frame callback the x87 fix needs for its safety check.
     int ts = install_tilescan(m, tile_mode, fpslog, wlog);
+    wchar_t dir[MAX_PATH];   // the game folder
+    wcscpy(dir, f);
+    dir[name - f - 1] = 0;
+    if (ts && install_fpslog(dir)) wlog("frame times to fps_log.csv (fps_on.txt found; delete it to stop)");
+    // script extender: only with a lua_ext folder in the game folder (scriptext.c); runs from the frame hook
+    if (ts) g_scriptext_on = install_scriptext(m, dir, wlog);
     st[0] = !ts ? FIX_INACTIVE : tile_mode ? FIX_ON : FIX_SWITCHED_OFF;
     if (!ts)
         wlog("x87 fix not installed (needs the frame hook)");
@@ -310,12 +327,17 @@ static void install_all(HMODULE m) {
 #ifdef PROFILING
     if (PRESENT(L"bridgeprobe.txt")) addon = 1;
 #endif
-    if (addon) {
-        wchar_t dir[MAX_PATH];
-        wcscpy(dir, f);
-        dir[name - f - 1] = 0;
-        install_bridgeprobe(m, dir, wlog);
-    }
+    if (addon) install_bridgeprobe(m, dir, wlog);
+    // other mods' DLLs from <game>\plugins (plugins.c), after every fix is in
+    if (!INI(L"mod", L"plugins")) wlog("plugins off (plugins=0 in rome2fix.ini)");
+    // from the load notification (another program loaded this DLL first) Windows refuses LoadLibrary (error 1168);
+    // later, on a thread, the game would already be running. shortcut: not loaded then (Attila: 0 of 5 player logs)
+    else if (g_late_install) {
+        wchar_t pd[MAX_PATH];
+        if (swprintf(pd, MAX_PATH, L"%ls\\plugins", dir) > 0 && GetFileAttributesW(pd) != INVALID_FILE_ATTRIBUTES)
+            wlog("plugins NOT loaded: another program loaded dinput8.dll before the game, and Windows allows no DLL loading "
+                 "at that point - this game start runs without the plugins folder");
+    } else load_plugins(dir, wlog);
 }
 
 // Something else in the process (an overlay, another hook DLL) can load dinput8.dll before the game loads
@@ -331,6 +353,7 @@ static VOID CALLBACK on_dll_loaded(ULONG reason, const NOTIF_DATA *d, PVOID ctx)
     if (reason != 1 || !d || !d->BaseDllName || d->BaseDllName->Length != sizeof want - sizeof(wchar_t)) return;
     if (_wcsnicmp(d->BaseDllName->Buffer, want, d->BaseDllName->Length / sizeof(wchar_t)) != 0) return;
     wlog("empire.retail.dll is loading now - installing the fixes");
+    g_late_install = 1;
     install_all((HMODULE)d->DllBase);
 }
 

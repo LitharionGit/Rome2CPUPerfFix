@@ -109,6 +109,11 @@ void fgp_set_vsync(int on);
 void fgp_set_vsync_available(int on);
 void fgp_set_vsync_driver(int v);
 void fgp_set_fps_counter(int corner);
+void fgp_set_key(int vk, const wchar_t *name);
+void fgb_release_gpu(void) __attribute__((weak));   // fgbridge.c / r2motion.c: the bridge's video memory back (weak for the offline tests)
+void r2m_release(void) __attribute__((weak));
+int fgb_d3d12_ok(ID3D11Device *dev) __attribute__((weak));   // fgbridge.c: the card has Direct3D 12 feature level 12_0
+const wchar_t *fgb_gpu_name(void);
 void fgp_set_fg(int fg);
 void fgp_set_tech(int sr, int fg);
 void fgp_di8_created(void *di);
@@ -140,6 +145,7 @@ static int g_motion, g_motion_on, g_view;   // the motion pass is set up / switc
 unsigned long long g_anim_sum_test[2];   // tests: their own animated shaders' checksums (2 bones, 4 bones)
 // live bridge state: 0 not started, 1 running, 2 off for the session (the game presents through the fallback)
 static int g_live, g_live_state;
+static int g_start_failed;   // the add-on is installed but did not start (helper, GPU, Proton): the panel says so (start_failed_panel)
 static wchar_t g_helper[MAX_PATH], g_sl[MAX_PATH];
 static char g_on_lines[2][MAX_PATH], g_on_test[32];   // fgbridge_on.txt's paths and test options, kept for settings_save
 static wchar_t g_settings[MAX_PATH];   // the release add-on's FrameBridge\settings.txt (the F11 panel saves to it); empty in dev runs
@@ -2086,6 +2092,14 @@ static int g_vsync = 1;
 // the frame-rate counter (F11 panel): rendered / shown frames per second in a corner; off by default
 static const char *const FPSC_KEYS[5] = {"off", "top_left", "top_right", "bottom_left", "bottom_right"};
 static int g_fpsc;
+// the key that opens the panel (default F8 since add-on version 7, as Attila: Mat's Attila 4K UI Scale holds F11)
+static const char *const KEY_KEYS[18] = {"f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+                                         "insert", "delete", "home", "end", "pause", "page_up"};
+static const int KEY_VK[18] = {VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
+                               VK_INSERT, VK_DELETE, VK_HOME, VK_END, VK_PAUSE, VK_PRIOR};
+static const wchar_t *const KEY_NAMES[18] = {L"F1", L"F2", L"F3", L"F4", L"F5", L"F6", L"F7", L"F8", L"F9", L"F10", L"F11", L"F12",
+                                             L"Insert", L"Delete", L"Home", L"End", L"Pause", L"Page Up"};
+static int g_pkey = 7;
 // technology: auto = NVIDIA DLSS / DLSS-G where the GPU has them, AMD FSR for the rest (cards that are not NVIDIA, frame
 // generation on RTX 20 / 30); fsr = AMD FSR for both; dlss = NVIDIA for both where it can; mixed = DLSS upscaling + AMD FSR
 // frame generation (Attila 6.10.0)
@@ -2096,7 +2110,7 @@ static void settings_save(void) {
     if (g_settings[0]) {
         FILE *f = _wfopen(g_settings, L"w");
         if (!f) { g_log("DLSS settings: %ls not writable - choices not saved", g_settings); return; }
-        fprintf(f, "# DLSS add-on settings. The F11 panel in game changes and saves them.\n"
+        fprintf(f, "# DLSS add-on settings. The panel in game (F8, see panel_key) changes and saves them.\n"
                    "# super_resolution: off, dlaa, quality, balanced, performance, ultra_performance\n"
                    "# frame_generation: off, 2x, 3x, 4x (limited to what your GPU allows)\n"
                    "# motion_vectors: per_object (Full: soldiers, horses, trees and plants, the default), camera_only (Fast: for weaker CPUs in very big battles)\n"
@@ -2109,13 +2123,14 @@ static void settings_save(void) {
                    "# fps_counter: off, top_left, top_right, bottom_left, bottom_right (rendered / shown frames per second)\n"
                    "# technology: auto, dlss, mixed, fsr (auto: NVIDIA DLSS where your GPU has it, AMD FSR for the rest; mixed: DLSS "
                    "upscaling + AMD FSR frame generation; fsr: AMD FSR for both)\n"
+                   "# panel_key: the key that opens this panel in game: f1 ... f12, insert, delete, home, end, pause, page_up (default f8)\n"
                    "# addon: on, off (off: the add-on does nothing at all from the next game start; set on again to use it)\n"
                    "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\nframe_cap=%s\ndlss_preset=%s\nsharpness=%s\nvsync=%s\n"
-                   "fps_counter=%s\ntechnology=%s\naddon=on\nversion=3\n",
+                   "fps_counter=%s\npanel_key=%s\ntechnology=%s\naddon=on\nversion=3\n",
                 SR_KEYS[g_sr >= 0 && g_sr < 6 ? g_sr : 2], FG_KEYS[g_fg < 4 ? g_fg : 0], g_motion_on ? "per_object" : "camera_only",
                 CAP_KEYS[g_fcap >= 0 && g_fcap < 5 ? g_fcap : 1], PRESET_KEYS[g_preset >= 0 && g_preset < 5 ? g_preset : 0],
                 SHARP_KEYS[g_sharp >= 0 && g_sharp < 4 ? g_sharp : 2], VSYNC_KEYS[g_vsync != 0], FPSC_KEYS[g_fpsc >= 0 && g_fpsc < 5 ? g_fpsc : 0],
-                TECH_KEYS[g_tech >= 0 && g_tech < 4 ? g_tech : 0]);
+                KEY_KEYS[g_pkey >= 0 && g_pkey < 18 ? g_pkey : 7], TECH_KEYS[g_tech >= 0 && g_tech < 4 ? g_tech : 0]);
         fclose(f);
         return;
     }
@@ -2406,6 +2421,67 @@ static void fallback_panel(ID3D11Resource *bb) {
     } else
         ID3D11Device_Release(d);
     if (ok) fgp_frame(bb, g_out_hwnd);
+}
+// The panel on the game's device with the current choices (motion: the row's state, -1 when it is not offered)
+static int panel_setup(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT w, UINT h, DXGI_FORMAT fmt, int motion) {
+    FgpApply ap = {panel_sr, panel_fg, panel_motion, panel_cap, panel_preset, panel_sharp, PANEL_VIEW, panel_vsync, panel_fps, panel_tech, PANEL_JTEST};
+    if (!fgp_init(dev, ctx, w, h, fmt, g_sr, (int)g_fg, motion, ap)) return 0;
+    fgp_set_sr_choices(6);
+    fgp_set_preset(g_preset);
+    fgp_set_sharp(g_sharp);
+    fgp_set_presets_available(fgb_helper_has_presets());
+    fgp_set_vsync(g_vsync);
+    fgp_set_vsync_available(fgb_helper_has_vsync());
+    fgp_set_vsync_driver(fgb_driver_vsync());
+    fgp_set_fps_counter(g_fpsc);
+    int tsr = g_tech == 1, tfg = g_tech == 1 || g_tech == 3;   // the drop-downs show the pick; auto shows what runs
+    if (g_tech == 0) { tsr = fgb_sr_backend() == 2; tfg = fgb_fg_backend() == 2; }
+    fgp_set_tech(tsr, tfg);
+    return 1;
+}
+// The add-on is installed but did not start (its helper failed, e.g. under Proton): the game presents as without it, and
+// the panel key still opens the panel over the game's own frames with a note why, instead of doing nothing (Attila
+// AGENT_LOG 201: players took a dead F11 for a key conflict). Choices are saved for the next start, as in fallback_panel.
+static void start_failed_panel(IDXGISwapChain *sc) {
+    static int tried, ok;
+    static HWND wnd;
+    ID3D11Resource *bb = NULL;
+    if (FAILED(IDXGISwapChain_GetBuffer(sc, 0, &iid_resource, (void **)&bb))) return;
+    if (!tried) {
+        tried = 1;
+        DXGI_SWAP_CHAIN_DESC sd;
+        D3D11_TEXTURE2D_DESC td;
+        ID3D11Device *d = NULL;
+        ID3D11DeviceContext *c = NULL;
+        ID3D11Texture2D_GetDesc((ID3D11Texture2D *)bb, &td);
+        if (SUCCEEDED(IDXGISwapChain_GetDesc(sc, &sd))) wnd = sd.OutputWindow;
+        ID3D11Resource_GetDevice(bb, &d);
+        if (d) ID3D11Device_GetImmediateContext(d, &c);
+        ok = wnd && c && panel_setup(d, c, td.Width, td.Height, td.Format, -1);   // the panel keeps d and c
+        static wchar_t gpu_note[200];
+        int d12 = !d || !fgb_d3d12_ok || fgb_d3d12_ok(d);
+        if (!d12) {   // the card itself: said by name, in the pop-up too (Attila AGENT_LOG 203)
+            _snwprintf(gpu_note, 200, L"%ls can't run DLSS or AMD FSR: it lacks DirectX 12 feature level 12_0.",
+                       fgb_gpu_name()[0] ? fgb_gpu_name() : L"This graphics card");
+            g_log("DLSS add-on: the game's graphics card (%ls) has no Direct3D 12 feature level 12_0 - DLSS and AMD FSR cannot run on it",
+                  fgb_gpu_name());
+        }
+        if (ok) fgp_set_note(d12 ? L"The upscaling add-on did not start - see rome2fix.log in the game folder. Choices made here are saved." : gpu_note);
+        else { if (c) ID3D11DeviceContext_Release(c); if (d) ID3D11Device_Release(d); }
+        g_log("panel (%ls): %s over the game's frames (the add-on did not start)", KEY_NAMES[g_pkey], ok ? "available" : "NOT available");
+    }
+    if (ok) {
+        static LARGE_INTEGER t0, qf;   // the FPS counter: the game's own frames (all of them are shown)
+        static unsigned frames;
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        if (!qf.QuadPart) { QueryPerformanceFrequency(&qf); t0 = t; }
+        frames++;
+        double dt = (double)(t.QuadPart - t0.QuadPart) / qf.QuadPart;
+        if (dt >= 0.5) { fgp_set_fps(frames / dt, frames / dt); frames = 0; t0 = t; }
+        fgp_frame(bb, wnd);
+    }
+    ID3D11Resource_Release(bb);
 }
 static void panel_frame(ID3D11Resource *bb) {   // at Present, before the frame goes to the helper: the panel is UI
     static LARGE_INTEGER t0, qf;
@@ -2720,7 +2796,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_create_sc(IDXGIFactory *f, IUnknown *dev, 
 static void bridge_off(void) {
     fgb_stop();
     g_live_state = 2;
-    if (g_motion) { r2m_set_enabled(0); r2m_frame_end(); g_motion = 0; }   // its draws hold the game's buffers
+    if (g_motion) { r2m_set_enabled(0); r2m_frame_end(); g_motion = 0; if (r2m_release) r2m_release(); }   // its draws hold the game's buffers; its view holds the bridge's texture
 }
 
 static HRESULT STDMETHODCALLTYPE present_body(IDXGISwapChain *sc, UINT sync, UINT flags);
@@ -2836,6 +2912,7 @@ static HRESULT STDMETHODCALLTYPE present_body(IDXGISwapChain *sc, UINT sync, UIN
         g_rs_fb = 0;
         return hr;
     }
+    if (g_start_failed && !g_hid_sc) start_failed_panel(sc);
     bp_frame();
     return r_present(sc, sync, flags);
 }
@@ -2964,22 +3041,13 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
             // every GPU now (Attila 6.10.0, Full by default): AMD FSR's upscaler needs real motion as much as frame generation
             g_motion = r2m_init(g_dev, g_ctx, fgb_mv_texture(), g_log);
             if (g_motion) { fgb_set_motion(motion_cb); r2m_after_wind = fgb_fill_begin; r2m_set_enabled(g_motion_on); }
-            FgpApply ap = {panel_sr, panel_fg, panel_motion, panel_cap, panel_preset, panel_sharp, PANEL_VIEW, panel_vsync, panel_fps, panel_tech, PANEL_JTEST};
-            if (fgp_init(g_dev, g_ctx, g_live_w, g_live_h, d->BufferDesc.Format, g_sr, (int)g_fg, g_motion ? g_motion_on : -1, ap)) {
-                fgp_set_sr_choices(6);
-                fgp_set_preset(g_preset);
-                fgp_set_sharp(g_sharp);
-                fgp_set_presets_available(fgb_helper_has_presets());
-                fgp_set_vsync(g_vsync);
-                fgp_set_vsync_available(fgb_helper_has_vsync());
-                fgp_set_vsync_driver(fgb_driver_vsync());
-                fgp_set_fps_counter(g_fpsc);
-                int tsr = g_tech == 1, tfg = g_tech == 1 || g_tech == 3;   // the drop-downs show the pick; auto shows what runs
-                if (g_tech == 0) { tsr = fgb_sr_backend() == 2; tfg = fgb_fg_backend() == 2; }
-                fgp_set_tech(tsr, tfg);
-            }
-            else g_log("frame bridge: F11 panel not available (back buffer format %u)", d->BufferDesc.Format);
-        } else if (hid) DestroyWindow(hid);
+            if (!panel_setup(g_dev, g_ctx, g_live_w, g_live_h, d->BufferDesc.Format, g_motion ? g_motion_on : -1))
+                g_log("frame bridge: F11 panel not available (back buffer format %u)", d->BufferDesc.Format);
+        } else {   // bridge off: its textures go too (Attila round 2 R2)
+            g_start_failed = 1;
+            if (fgb_release_gpu) fgb_release_gpu();
+            if (hid) DestroyWindow(hid);
+        }
     }
     // after the bridge a swapchain on the game's window is never shown (fgbridge.c, fallback): the game's new one goes to a
     // hidden window too and its frames reach the window through the mod's swapchain
@@ -3172,6 +3240,8 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
         g_sharp = settings_value(text, "sharpness=", SHARP_KEYS, 4, 1);                     // default low
         g_vsync = settings_value(text, "vsync=", VSYNC_KEYS, 2, 1);                         // default on (files without the key too)
         g_fpsc = settings_value(text, "fps_counter=", FPSC_KEYS, 5, 0);                    // default off
+        g_pkey = settings_value(text, "panel_key=", KEY_KEYS, 18, 7);                      // default F8 (files without the key too)
+        fgp_set_key(KEY_VK[g_pkey], KEY_NAMES[g_pkey]);
         g_tech = settings_value(text, "technology=", TECH_KEYS, 4, 0);                     // default auto (files without the key too)
         fgb_set_tech(g_tech == 1 ? 2 : g_tech == 3 ? 3 : 1);   // auto and dlss: 1 (NVIDIA where it can, AMD FSR for the rest)
         log("  technology: %s", g_tech == 1 ? "AMD FSR for upscaling and frame generation" : g_tech == 3 ? "DLSS upscaling + AMD FSR frame generation"
@@ -3184,8 +3254,8 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
         g_live = 1;
         g_dev_di8_created = fgp_di8_created;   // the panel hides the game's mouse buttons while the cursor is over it
         log("DLSS add-on found: super resolution %s, frame generation %s, motion vectors %s, frame cap %s, preset %s, sharpness %s, V-Sync %s, "
-            "FPS counter %s (%ls%s%s)", SR_KEYS[g_sr], FG_KEYS[g_fg], MV_KEYS[g_motion_on], CAP_KEYS[g_fcap], PRESET_KEYS[g_preset], SHARP_KEYS[g_sharp],
-            VSYNC_KEYS[g_vsync], FPSC_KEYS[g_fpsc], sf ? L"settings.txt" : L"defaults",
+            "FPS counter %s, panel key %ls (%ls%s%s)", SR_KEYS[g_sr], FG_KEYS[g_fg], MV_KEYS[g_motion_on], CAP_KEYS[g_fcap], PRESET_KEYS[g_preset], SHARP_KEYS[g_sharp],
+            VSYNC_KEYS[g_vsync], FPSC_KEYS[g_fpsc], KEY_NAMES[g_pkey], sf ? L"settings.txt" : L"defaults",
             reset_mv ? "; camera_only was the old default, now per_object (Full)" : "", "");
         if (!sf || ver < 3) settings_save();   // the file to edit, with its comments, from the first start on
     }

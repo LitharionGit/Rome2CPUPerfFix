@@ -54,12 +54,17 @@ static unsigned s_hud_n;
 static HWND s_hwnd;
 static ID3D11Texture2D *s_stage;
 static void stub_motion(ID3D11Resource *depth);
+static int s_startfail;   // "startfail": the helper does not start (as under Proton); "startfail nod3d12": a card without feature level 12_0
+static int s_released, s_d3d12 = 1;
+void fgb_release_gpu(void) { s_released++; }
+int fgb_d3d12_ok(ID3D11Device *dev) { (void)dev; return s_d3d12; }
+const wchar_t *fgb_gpu_name(void) { return L"Test GPU"; }
 int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UINT h, DXGI_FORMAT fmt, const wchar_t *helper,
               const wchar_t *sl, const wchar_t *logdir, unsigned fg, void (*log)(const char *, ...)) {
     (void)dev; (void)ctx; (void)fmt; (void)helper; (void)sl; (void)logdir; (void)fg; (void)log;
     s_started++;
     s_hwnd = hwnd;
-    return w == W && h == H;
+    return !s_startfail && w == W && h == H;
 }
 // the HUD-less copy: the back buffer's centre must be the scene's blue copy (not the red UI, not last frame's picture)
 // and vp this frame's main camera (not the shadow or reflection camera)
@@ -121,6 +126,8 @@ void fgb_react_end(void) {}
 unsigned fgb_react_frames(void) { return 0; }
 void fgp_set_vsync_driver(int v) { (void)v; }
 void fgp_set_fps_counter(int corner) { (void)corner; }
+static int s_key_vk;
+void fgp_set_key(int vk, const wchar_t *name) { (void)name; s_key_vk = vk; }
 void fgp_set_fg(int fg) { (void)fg; }
 void fgp_set_tech(int sr, int fg) { (void)sr; (void)fg; }
 ID3D11Texture2D *fgb_mv_texture(void) {
@@ -367,6 +374,8 @@ int main(int argc, char **argv) {
 #else
     int nofg = argc > 1 && !strcmp(argv[1], "nofg");
     s_fg_max = !nofg;
+    s_startfail = argc > 1 && !strcmp(argv[1], "startfail");
+    s_d3d12 = !(s_startfail && argc > 2 && !strcmp(argv[2], "nod3d12"));
     if (argc > 1 && !strcmp(argv[1], "addon")) {   // the release add-on: <game>\FrameBridge\helper64.exe + settings.txt, no fgbridge_on.txt
         wchar_t fb[MAX_PATH], q[MAX_PATH];
         swprintf(fb, MAX_PATH, L"%ls\\FrameBridge", dir);
@@ -414,8 +423,11 @@ int main(int argc, char **argv) {
         static const char *const MV[2] = {"camera_only", "per_object"};
         CHECK(settings_value(text, "super_resolution=", SR_KEYS, 6, 1) == 4 && settings_value(text, "frame_generation=", FG_KEYS, 4, 1) == 0 &&
               settings_value(text, "motion_vectors=", MV, 2, 1) == 0 && settings_value(text, "frame_cap=", CAP_KEYS, 5, 1) == 4 &&
-              settings_value(text, "dlss_preset=", PRESET_KEYS, 5, 0) == 4 && settings_value(text, "sharpness=", SHARP_KEYS, 4, 1) == 3,
+              settings_value(text, "dlss_preset=", PRESET_KEYS, 5, 0) == 4 && settings_value(text, "sharpness=", SHARP_KEYS, 4, 1) == 3 &&
+              settings_value(text, "panel_key=", KEY_KEYS, 18, 0) == 7 && s_key_vk == VK_F8,
               "settings.txt as saved:\n%s", text);
+        CHECK(settings_value("panel_key=insert\n", "panel_key=", KEY_KEYS, 18, 7) == 12 && settings_value("panel_key=f11\n", "panel_key=", KEY_KEYS, 18, 7) == 10 &&
+              settings_value("panel_key=f1x\n", "panel_key=", KEY_KEYS, 18, 7) == 7, "panel_key values");
         const char *own = "# a comment\nsuper_resolution=balanced\nframe_generation=3x\nmotion_vectors=per_object\nframe_cap=90\naddon=on\n";
         CHECK(settings_value(own, "super_resolution=", SR_KEYS, 6, 2) == 3 && settings_value(own, "frame_generation=", FG_KEYS, 4, 1) == 2 &&
               settings_value(own, "motion_vectors=", MV, 2, 0) == 1 && settings_value(own, "frame_cap=", CAP_KEYS, 5, 1) == 3 &&
@@ -464,6 +476,15 @@ int main(int argc, char **argv) {
                                 hwnd, TRUE, DXGI_SWAP_EFFECT_DISCARD, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH};
     IDXGISwapChain *sc;
     CHECK(SUCCEEDED(IDXGIFactory_CreateSwapChain(fac, (IUnknown *)dev, &scd, &sc)), "swapchain");
+    if (s_startfail) {   // the add-on did not start: the game presents on its own window and the panel opens over its frames
+        for (int i = 0; i < 3; i++) IDXGISwapChain_Present(sc, 0, 0);
+        CHECK(g_live_state == 2 && !g_hid_sc && g_start_failed && s_panel_motion == -1 && s_panel_frames == 3 && s_panel_note &&
+                  wcsstr(s_panel_note, s_d3d12 ? L"did not start" : L"Test GPU can't run DLSS or AMD FSR"),
+              "panel after a failed start: state %d, drawn in %d frames, note %ls", g_live_state, s_panel_frames, s_panel_note ? s_panel_note : L"-");
+        CHECK(s_released == 1, "bridge's GPU memory released after the failed start: %d", s_released);
+        printf("bridge live test (add-on did not start: panel over the game's frames) passed\n");
+        return 0;
+    }
     CHECK(off || (g_live_state == 1 && g_hid_sc == sc), "bridge not started (state %d)", g_live_state);
     DXGI_SWAP_CHAIN_DESC got;
     if (off) IDXGISwapChain_GetDesc(sc, &got);

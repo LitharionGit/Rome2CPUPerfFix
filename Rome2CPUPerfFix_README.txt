@@ -137,7 +137,8 @@ after writing it; delete it to get the defaults back.
   missing_file_cache   loose-file check cache (loading)
   [mod]
   self_update          copy a newer version from the Steam Workshop at startup
-  crash_logging        record crashes in rome2fix.log
+  crash_logging        record crashes in rome2fix.log (and a crash_*.dmp file)
+  plugins              load other mods' DLLs from the plugins folder (2.1)
 
 The older way still works too: an empty tilescan_off.txt, x87fix_off.txt,
 sortfix_off.txt, attrcache_off.txt, fileio_off.txt or strfix_off.txt in the
@@ -156,9 +157,29 @@ from the game folder (it's a small text file). Send the block from the last "===
 - other DLLs in the game folder that hook the game (ReShade, DXVK, other mods)
 - for a crash: where it happened (EXCEPTION lines, with a plain line saying
   whether it was in the game's own code or in this mod), so it can be traced
+Since 2.1 the log also has your graphics card, driver, display, free memory and
+disk space and the mods you have on, a "FREEZE?" line when the game stops
+drawing frames for 20 s, and memory warnings when the 32-bit game runs low.
+The first crash of a session also writes a crash_<date>_<time>.dmp file into
+the game folder (the newest 3 are kept): please attach it to a crash report.
 The log only records; it never changes how the game handles a crash. It shows
 your Windows user name in folder paths, so blank that out before posting it
 publicly if you like.
+
+
+For modders (new in 2.1)
+------------------------
+- Plugins: any DLL in a plugins folder in the game folder is loaded at game
+  start, in name order (for example plugins\smoke.dll), so a DLL mod doesn't
+  need its own dinput8.dll / xinput slot. rome2fix.log lists each one.
+  plugins=0 in rome2fix.ini switches them off.
+- Lua scripts: .lua files in a lua_ext folder in the game folder run in every
+  script environment the game opens (front end, campaign), and Ctrl+` opens a
+  Lua console. ext_print and errors go to lua_ext\lua_ext.log. Nothing runs
+  without the lua_ext folder. Steam version of the game only.
+- Frame times: create an empty fps_on.txt in the game folder before starting
+  the game: fps_log.csv gets one line per second (fps, 1% low, worst frame)
+  and a summary when you delete fps_on.txt.
 
 
 Compatibility and notes
@@ -196,6 +217,8 @@ without setting anything. Nothing changes for ReShade without the add-on.
 white lines along the right edge with DLAA while the camera moves.
 2.0 brings AMD FSR, motion data for swaying trees and plants, and the F11 FPS
 counter and recommended setup, together with add-on version 6.
+2.1 moves the add-on's settings panel to F8 (panel_key= in its settings.txt
+picks another key) and shows it, with a note, when the add-on could not start.
 
 
 Third-party notices
@@ -227,6 +250,28 @@ is published for review at github.com/JSa25/Rome2CPUPerfFix.
 
 Changelog
 ---------
+Version 2.1:
+           - with the DLSS add-on (version 7): the settings panel opens
+           with F8 (was F11, which other mods use); panel_key= in
+           FrameBridge\settings.txt picks another key. When the add-on
+           cannot start, F8 still opens the panel with a note, a small
+           card at the top of the screen says what broke, and a graphics
+           card without DirectX 12 feature level 12_0 is named.
+           - with the add-on: the helper may take up to 30 s to start
+           (slow laptops got no DLSS); switching DLSS / FSR in the panel
+           is quicker and safer; the add-on's video memory (about 400 MB
+           at 4K) is freed when it turns off.
+           - plugins folder: other mods' DLLs load from it (see "For
+           modders").
+           - Lua scripts and a Lua console (lua_ext folder).
+           - crash reports: a crash dump file, a freeze line, your PC's
+           specs and mod list, and memory warnings in rome2fix.log; the
+           crash logger itself can no longer crash on a damaged module.
+           - fps_on.txt: a frame-time log (fps_log.csv).
+           - self-update no longer takes a Workshop file Steam hasn't
+           finished downloading.
+           SHA-256 of dinput8.dll:
+           654ea8f1ff1838eaa1116fb361255f2b7e933dac405ca21629ed9919a9411a0b
 Version 2.0:
            - with the DLSS add-on (version 6): AMD FSR upscaling and frame
            generation for AMD, Intel and older NVIDIA cards, and F11's

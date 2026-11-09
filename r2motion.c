@@ -256,6 +256,14 @@ int r2m_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *mv, v
     return 1;
 }
 void r2m_set_enabled(int on) { m_enabled = on; }
+// The bridge is off for the session: the pass stops, and its view of the bridge's shared motion-vector texture goes so
+// that video memory is freed (fgb_release_gpu; Attila round 2 R1)
+void r2m_release(void) {
+    if (!m_dev) return;
+    m_on = 0;
+    m_enabled = 0;
+    if (m_mv_rtv) { ID3D11RenderTargetView_Release(m_mv_rtv); m_mv_rtv = NULL; }
+}
 // instances whose own motion this frame stays under px render pixels are not redrawn (0: all; the shaders' cull_px); dev
 // measurement: < 0 = all the vertex work, no triangle drawn (what the redraw's vertex shaders cost by themselves)
 static float m_cull_px = 0.125f;

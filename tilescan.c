@@ -104,6 +104,7 @@ static const unsigned char ENTRY_BYTES[8] = {0x83, 0xEC, 0x10, 0x53, 0x8B, 0x5C,
 void *g_entry_back;
 static unsigned char *g_loop_a, *g_loop_b, g_orig[2][5], g_new[2][5];
 static int g_ab, g_on, g_fpslog;
+void fpslog_frame(void);  // fpslog.c
 void (*g_frame_check)(void);  // per-frame callback on the main thread (x87fix_frame)
 void (*g_ab_flip)(int on);    // A/B test of another fix: flipped instead of the tile scan
 const char *g_ab_name = "tile scan";
@@ -131,6 +132,7 @@ void __cdecl tilescan_entry(void) {
         if (g_ab) { g_ab = 0; tilescan_enable(1); g_log("tile feedback scan: called from a second thread - A/B mode stopped, fix stays on"); }
         return;
     }
+    fpslog_frame();   // frame counter (crash records, freeze watchdog) and fps_log.csv
     if (g_frame_check) g_frame_check();
     g_frames++;
     if (!g_t0) g_t0 = now;

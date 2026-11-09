@@ -58,6 +58,14 @@ static int p_vsync_driver;   // NVIDIA's driver setting (FgbShared::driver_vsync
 void fgp_set_vsync_driver(int v) { p_vsync_driver = v; p_dirty = 1; }
 static int p_fpson;   // the frame-rate counter (row 8): 0 off, 1..4 top left / top right / bottom left / bottom right
 static int p_cdirty = 1;
+// the key that opens / closes the panel (settings.txt panel_key=, default F8 as in Attila since 2026-11-02: Mat's Attila
+// 4K UI Scale holds F11 for its compare picture, and both mods read the key directly)
+static int p_key = VK_F8;
+static wchar_t p_keyhint[32] = L"F8 to close", p_keyname[16] = L"F8";
+static int t_dirty = 1;   // the pop-up's picture (toast_redraw) is out of date
+void fgp_set_key(int vk, const wchar_t *name) {
+    p_key = vk; _snwprintf(p_keyhint, 32, L"%ls to close", name); _snwprintf(p_keyname, 16, L"%ls", name); p_dirty = t_dirty = 1;
+}
 void fgp_set_fps_counter(int corner) { p_fpson = corner >= 0 && corner < 5 ? corner : 0; p_dirty = p_cdirty = 1; }
 void fgp_set_fg(int fg) { p_fg = fg; p_dirty = 1; }   // after an F11 switch: what the new helper allows
 static int p_tsr, p_tfg;   // the picked upscaler / frame generation (rows 9 / 10): 0 NVIDIA DLSS, 1 AMD FSR; from the next start
@@ -294,7 +302,7 @@ static void redraw(void) {
     float x0 = p_cx0 + 26 * u, x1 = p_cx1 - 26 * u, y = p_cy0 + 16 * u;
     // heading, and how to close it
     text(SR_AMD ? L"AMD FSR" : FG_AMD ? L"DLSS + AMD FSR" : L"DLSS", p_title, C_TEXT, (int)x0, (int)y, (int)(x0 + (FG_AMD ? 300 : 200) * u), (int)(y + 36 * u), DT_LEFT);
-    text(L"F11 to close", p_tiny, C_DIM, (int)(x1 - 90 * u), (int)y, (int)x1, (int)(y + 36 * u), DT_RIGHT);
+    text(p_keyhint, p_tiny, C_DIM, (int)(x1 - 98 * u), (int)y, (int)x1, (int)(y + 36 * u), DT_RIGHT);
     {   // Defaults: everything back to the recommendation below (the frame-rate counter stays as it is)
         float bx0 = x1 - 200 * u, bx1 = x1 - 100 * u, by0 = y + 5 * u, by1 = y + 31 * u;
         int hot = p_nbtn == p_hover;
@@ -322,7 +330,7 @@ static void redraw(void) {
     // Default: NVIDIA's documented preset for the mode (Streamline 2.14.16 reports none in use, and the NVIDIA app's override
     // can change it): DLAA / Quality / Balanced K, Performance M, Ultra Performance L
     if (SR_AMD) _snwprintf(cap[4], 64, L"NVIDIA DLSS only");
-    else if (!p_presets_ok) _snwprintf(cap[4], 64, L"Update the DLSS add-on for this");
+    else if (!p_presets_ok) _snwprintf(cap[4], 64, p_note ? L"The add-on is not running" : L"Update the DLSS add-on for this");   // p_note: it did not start or is off
     else if (!p_sr) _snwprintf(cap[4], 64, L"Needs Super Resolution or DLAA");
     else if (!p_preset) _snwprintf(cap[4], 64, L"NVIDIA's pick here: %lc", L"-KKKML"[p_sr < 6 ? p_sr : 0]);
     else _snwprintf(cap[4], 64, L"%ls", preset_caps[p_preset]);
@@ -332,7 +340,7 @@ static void redraw(void) {
                : p_view ? L"Textures without the mip bias" : L"The frame as it is");
     _snwprintf(cap[11], 64, L"What DLSS is told of the jitter");
     _snwprintf(cap[7], 64, p_vsync_driver == 2 ? L"Forced On in NVIDIA's settings" : p_vsync_driver == 3 ? L"Forced Off in NVIDIA's settings"
-               : p_vsync_driver == 4 ? L"Fast Sync in NVIDIA's settings" : !p_vsync_ok ? L"Update the DLSS add-on for this"
+               : p_vsync_driver == 4 ? L"Fast Sync in NVIDIA's settings" : !p_vsync_ok ? (p_note ? L"The add-on is not running" : L"Update the DLSS add-on for this")
                : p_vsync ? L"No tearing, up to the screen's rate"
                                                                                      : L"No cap, the picture may tear");
     static const wchar_t *const label[12] = {L"Super Resolution", L"Frame Generation", L"Motion Vectors", L"Frame Cap", L"DLSS Preset",
@@ -515,6 +523,61 @@ static void counter_redraw(void) {
         }
     ID3D11DeviceContext_UpdateSubresource(p_ctx, (ID3D11Resource *)c_tex, 0, NULL, c_rgba, c_w * 4, 0);
 }
+
+// ---- the pop-up (top middle, Attila AGENT_LOG 203): a new note (fgp_set_note: the add-on did not start, DLSS turned off)
+// shown by itself for 30 s in front, so a player sees what broke without opening the panel; it goes when the panel opens ----
+static HDC t_dc;
+static HBITMAP t_bmp;
+static unsigned char *t_bits, *t_rgba;
+static ID3D11Texture2D *t_tex;
+static ID3D11ShaderResourceView *t_srv;
+static int t_w, t_h, t_show;   // t_show: 1 waiting for its first frame, 2 on screen
+static ULONGLONG t_end;
+static void toast_redraw(void) {
+    if (!t_dc) {
+        t_w = (int)(760 * p_u); t_h = (int)(62 * p_u);
+        BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), t_w, -t_h, 1, 32, BI_RGB, 0, 0, 0, 0, 0}, {{0, 0, 0, 0}}};
+        t_dc = CreateCompatibleDC(NULL);
+        t_bmp = t_dc ? CreateDIBSection(t_dc, &bi, DIB_RGB_COLORS, (void **)&t_bits, NULL, 0) : NULL;
+        t_rgba = malloc((size_t)t_w * t_h * 4);
+        if (!t_bmp || !t_rgba) { t_show = 0; return; }
+        SelectObject(t_dc, t_bmp);
+    }
+    if (!t_tex) {   // on the panel's device: made again after fgp_move_device
+        D3D11_TEXTURE2D_DESC td = {(UINT)t_w, (UINT)t_h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        if (FAILED(ID3D11Device_CreateTexture2D(p_dev, &td, NULL, &t_tex)) ||
+            FAILED(ID3D11Device_CreateShaderResourceView(p_dev, (ID3D11Resource *)t_tex, NULL, &t_srv))) { t_show = 0; return; }
+    }
+    // the card: dark, a bronze edge on the left; the note (without "Choices made here are saved", which is about the panel)
+    // and under it which key opens the panel
+    int u2 = (int)(2 * p_u + 0.5f), x0 = (int)(18 * p_u);
+    RECT all = {0, 0, t_w, t_h}, edge = {0, 0, (int)(4 * p_u + 0.5f), t_h};
+    HBRUSH bg = CreateSolidBrush(RGB(24, 22, 20)), br = CreateSolidBrush(RGB(C_BRONZE >> 16 & 255, C_BRONZE >> 8 & 255, C_BRONZE & 255));
+    FillRect(t_dc, &all, bg);
+    FillRect(t_dc, &edge, br);
+    DeleteObject(bg); DeleteObject(br);
+    wchar_t note[160], hint[64];
+    _snwprintf(note, 160, L"%ls", p_note ? p_note : L"");
+    wchar_t *cut = wcsstr(note, L" Choices made here");
+    if (cut) *cut = 0;
+    _snwprintf(hint, 64, L"%ls opens the upscaling panel", p_keyname);
+    SetBkMode(t_dc, TRANSPARENT);
+    RECT r1 = {x0, u2 * 4, t_w - x0, t_h / 2 + u2}, r2 = {x0, t_h / 2 + u2, t_w - x0, t_h - u2 * 4};
+    SelectObject(t_dc, p_small);
+    SetTextColor(t_dc, RGB(C_TEXT >> 16 & 255, C_TEXT >> 8 & 255, C_TEXT & 255));
+    DrawTextW(t_dc, note, -1, &r1, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(t_dc, p_tiny);
+    SetTextColor(t_dc, RGB(C_BRONZE >> 16 & 255, C_BRONZE >> 8 & 255, C_BRONZE & 255));
+    DrawTextW(t_dc, hint, -1, &r2, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    GdiFlush();
+    // BGRA to RGBA, the whole card slightly see-through (premultiplied, as the panel)
+    for (size_t i = 0, n = (size_t)t_w * t_h; i < n; i++) {
+        const unsigned char *b = t_bits + i * 4;
+        unsigned char *o = t_rgba + i * 4;
+        o[0] = (unsigned char)(b[2] * 235 / 255); o[1] = (unsigned char)(b[1] * 235 / 255); o[2] = (unsigned char)(b[0] * 235 / 255); o[3] = 235;
+    }
+    ID3D11DeviceContext_UpdateSubresource(p_ctx, (ID3D11Resource *)t_tex, 0, NULL, t_rgba, t_w * 4, 0);
+}
 static void blend_panel(ID3D11Resource *bb, ID3D11ShaderResourceView *tex, int tx, int ty, int tw, int th) {
     ID3D11DeviceContext *c = p_ctx;
     // the back buffer's view for this call only: a view kept between frames holds a reference to the back buffer, and the
@@ -631,7 +694,10 @@ static void make_mask(void) {
         }
 }
 
-void fgp_set_note(const wchar_t *note) { p_note = note; p_dirty = 1; }
+void fgp_set_note(const wchar_t *note) {
+    if (note && note != p_note) t_show = 1;   // something new broke: the pop-up says so
+    p_note = note; p_dirty = t_dirty = 1;
+}
 
 // The panel's GPU objects made again on another device (a settings change can come with a new D3D11 device; the panel
 // then sits over the frames the mod shows after the bridge, fgbridge.c fallback). bw / bh: that back buffer's size, for
@@ -641,8 +707,9 @@ int fgp_move_device(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT b
 #define DROP(x) if (x) { (x)->lpVtbl->Release(x); (x) = NULL; }
     DROP(p_rtv); DROP(p_srv); DROP(p_tex); DROP(p_vs); DROP(p_ps); DROP(p_blend); DROP(p_rs); DROP(p_dss);
     DROP(c_srv); DROP(c_tex);   // the FPS counter's too: counter_redraw makes them on the new device (Attila's ultrareview)
+    DROP(t_srv); DROP(t_tex);   // and the pop-up's
 #undef DROP
-    p_cdirty = 1;
+    p_cdirty = t_dirty = 1;
     p_dev = dev; p_ctx = ctx; p_bw = bw; p_bh = bh;
     D3D11_TEXTURE2D_DESC td = {(UINT)p_w, (UINT)p_h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
     p_ok = SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &p_tex)) && pipeline();
@@ -685,11 +752,11 @@ void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
         if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), (MONITORINFO *)&mi) &&
             EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) { p_hz = dm.dmDisplayFrequency; p_dirty = 1; }
     }
-    static SHORT f11_prev, lb_prev;
+    static SHORT key_prev, lb_prev;
     int focus = GetForegroundWindow() == hwnd;
-    SHORT f11 = focus ? GetAsyncKeyState(VK_F11) : 0, lb = focus ? GetAsyncKeyState(VK_LBUTTON) : 0;
-    if ((f11 & 0x8000) && !(f11_prev & 0x8000)) { p_open = !p_open; p_dirty = 1; }
-    f11_prev = f11;
+    SHORT key = focus ? GetAsyncKeyState(p_key) : 0, lb = focus ? GetAsyncKeyState(VK_LBUTTON) : 0;
+    if ((key & 0x8000) && !(key_prev & 0x8000)) { p_open = !p_open; p_dirty = 1; }
+    key_prev = key;
     int over = 0, mx = 0, my = 0, hover = -1;
     if (p_open) {
         POINT c;
@@ -734,6 +801,18 @@ void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
         if (p_cdirty || !c_tex) { counter_redraw(); p_cdirty = 0; }
         int left = p_fpson == 1 || p_fpson == 3, top = p_fpson <= 2, mg = (int)(12 * p_u);
         if (c_srv) blend_panel(backbuffer, c_srv, left ? mg : (int)p_bw - c_w - mg, top ? mg : (int)p_bh - c_h - mg, c_w, c_h);
+    }
+    if (t_show) {   // the pop-up, until the panel opens or its 30 s are up
+        static ULONGLONG t_last;
+        ULONGLONG now = GetTickCount64();
+        if (t_show == 1) { t_show = 2; t_end = now + 30000; }
+        else if (!focus) t_end += now - t_last;   // counts only while the game is in front
+        t_last = now;
+        if (p_open || now >= t_end) t_show = 0;
+        else {
+            if (t_dirty || !t_tex) { toast_redraw(); t_dirty = 0; }
+            if (t_srv && t_show) blend_panel(backbuffer, t_srv, ((int)p_bw - t_w) / 2, (int)(p_bh * 0.06f), t_w, t_h);
+        }
     }
     if (!p_open) return;
     if (p_dirty) { redraw(); p_dirty = 0; }
