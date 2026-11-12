@@ -688,4 +688,3 @@ int install_memwatch(
 
     return n;
 }
-```
