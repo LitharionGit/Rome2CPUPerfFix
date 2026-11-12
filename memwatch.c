@@ -1,21 +1,25 @@
 // Address-space watch.
 //
 // Rome II is a 32-bit game and can crash when its virtual address space
-// becomes fragmented. This hooks the game DLL's imports:
+// becomes fragmented.
+//
+// This hooks the game DLL's imports:
 //
 //   - MapViewOfFile
 //   - VirtualAlloc
 //   - VirtualFree
 //
-// Existing behaviour:
+// Diagnostics:
+//
 //   * failed file maps and VirtualAlloc calls are logged
-//   * the largest free address-space block is monitored
+//   * successful VirtualAlloc calls >= LARGE_ALLOC_MB are logged
+//   * successful VirtualFree calls >= LARGE_ALLOC_MB are logged
+//   * free total and largest contiguous free block are recorded
+//   * suspicious drops of the largest free block are highlighted
+//   * caller addresses are logged to help identify the responsible code
 //
-// Additional diagnostics:
-//   * successful large VirtualAlloc calls are logged
-//   * large VirtualFree calls are logged
-//
-// This should help identify allocations that fragment the address space.
+// The goal is to identify address-space fragmentation rather than merely
+// looking for one extremely large allocation.
 
 #include <windows.h>
 #include <stdio.h>
@@ -25,23 +29,52 @@
 // Configuration
 // ------------------------------------------------------------
 
-// Only log successful allocations/frees at or above this size.
-// 4 MB is a reasonable starting point to avoid flooding the log.
+// Log successful allocations/frees at or above this size.
+//
+// 4 MB gives detailed diagnostics.
+// Increase to 8 or 16 MB if the log becomes too large.
 enum {
     LARGE_ALLOC_MB = 4,
-    MAX_FAIL_LOGS  = 40
+
+    // Maximum number of failed allocations to log.
+    MAX_FAIL_LOGS = 40,
+
+    // Highlight when the largest contiguous free block shrinks
+    // by at least this amount after one logged allocation.
+    FRAGMENT_DROP_MB = 32
 };
 
-#define LARGE_ALLOC_BYTES ((SIZE_T)LARGE_ALLOC_MB * 1024 * 1024)
+#define LARGE_ALLOC_BYTES \
+    ((SIZE_T)LARGE_ALLOC_MB * 1024 * 1024)
+
+#define FRAGMENT_DROP_BYTES \
+    ((SIZE_T)FRAGMENT_DROP_MB * 1024 * 1024)
 
 
 // ------------------------------------------------------------
 // Address-space statistics
 // ------------------------------------------------------------
+//
+// Calculates:
+//
+//   free_total
+//       Total free virtual address space.
+//
+//   largest
+//       Largest contiguous free block.
+//
+// This distinction is important:
+//
+//   700 MB free in total
+//   largest block only 144 MB
+//
+// means that a 200 MB contiguous allocation can already fail.
+//
 
-// Free total and largest free block of this process's 32-bit address space.
-
-static void address_space(size_t *free_total, size_t *largest)
+static void address_space(
+    size_t *free_total,
+    size_t *largest
+)
 {
     MEMORY_BASIC_INFORMATION m;
 
@@ -49,11 +82,21 @@ static void address_space(size_t *free_total, size_t *largest)
     *largest = 0;
 
     for (
-        unsigned char *a = (unsigned char *)0x10000;
-        VirtualQuery(a, &m, sizeof m) == sizeof m;
-        a = (unsigned char *)m.BaseAddress + m.RegionSize
+        unsigned char *a =
+            (unsigned char *)0x10000;
+
+        VirtualQuery(
+            a,
+            &m,
+            sizeof m
+        ) == sizeof m;
+
+        a =
+            (unsigned char *)m.BaseAddress +
+            m.RegionSize
     ) {
         if (m.State == MEM_FREE) {
+
             *free_total += m.RegionSize;
 
             if (m.RegionSize > *largest)
@@ -61,8 +104,12 @@ static void address_space(size_t *free_total, size_t *largest)
         }
 
         // Overflow protection.
-        if ((unsigned char *)m.BaseAddress + m.RegionSize < a)
+        if (
+            (unsigned char *)m.BaseAddress +
+            m.RegionSize < a
+        ) {
             break;
+        }
     }
 }
 
@@ -71,11 +118,15 @@ static void address_space(size_t *free_total, size_t *largest)
 // Globals
 // ------------------------------------------------------------
 
-static void (*g_log)(const char *fmt, ...);
+static void (*g_log)(
+    const char *fmt,
+    ...
+);
 
 static void (*g_trim)(void);
-// The pools and the game's heap give free memory back.
-// NULL with the heap fix off.
+
+
+// Original imported functions.
 
 static LPVOID (WINAPI *o_MapViewOfFile)(
     HANDLE,
@@ -99,10 +150,101 @@ static BOOL (WINAPI *o_VirtualFree)(
 );
 
 
-// Separate caps for file maps and failed VirtualAlloc calls.
+// Logging caps.
 
 static volatile LONG g_fail_logged;
 static volatile LONG g_va_logged;
+
+
+// ------------------------------------------------------------
+// Helper: log address-space change
+// ------------------------------------------------------------
+//
+// Logs the state after a relevant allocation/free and highlights
+// significant fragmentation events.
+//
+
+static void log_space_change(
+    const char *operation,
+    SIZE_T size,
+    LPVOID address,
+    DWORD type,
+    DWORD protect,
+    size_t before_free,
+    size_t before_big,
+    void *caller
+)
+{
+    size_t after_free;
+    size_t after_big;
+
+    address_space(
+        &after_free,
+        &after_big
+    );
+
+    long free_delta_mb =
+        (long)(after_free >> 20) -
+        (long)(before_free >> 20);
+
+    long big_delta_mb =
+        (long)(after_big >> 20) -
+        (long)(before_big >> 20);
+
+    g_log(
+        "memory: %s %lu KB at %p "
+        "(type 0x%08lX, protect 0x%08lX, caller %p; "
+        "free %u MB -> %u MB [%+ld MB], "
+        "largest block %u MB -> %u MB [%+ld MB])",
+
+        operation,
+
+        (unsigned long)(size >> 10),
+
+        address,
+
+        (unsigned long)type,
+
+        (unsigned long)protect,
+
+        caller,
+
+        (unsigned)(before_free >> 20),
+        (unsigned)(after_free >> 20),
+        free_delta_mb,
+
+        (unsigned)(before_big >> 20),
+        (unsigned)(after_big >> 20),
+        big_delta_mb
+    );
+
+
+    // Highlight significant fragmentation caused by an allocation.
+
+    if (
+        strcmp(operation, "VirtualAlloc OK") == 0 &&
+        before_big > after_big &&
+        before_big - after_big >=
+            FRAGMENT_DROP_BYTES
+    ) {
+        g_log(
+            "memory: FRAGMENTATION EVENT - "
+            "largest free block dropped by %u MB "
+            "after allocation of %lu KB at %p "
+            "(caller %p)",
+
+            (unsigned)(
+                (before_big - after_big) >> 20
+            ),
+
+            (unsigned long)(size >> 10),
+
+            address,
+
+            caller
+        );
+    }
+}
 
 
 // ------------------------------------------------------------
@@ -116,12 +258,20 @@ static void failed(
     int retried_ok
 )
 {
-    if (InterlockedIncrement(&g_fail_logged) > MAX_FAIL_LOGS)
+    if (
+        InterlockedIncrement(&g_fail_logged) >
+        MAX_FAIL_LOGS
+    ) {
         return;
+    }
 
-    size_t fr, big;
+    size_t fr;
+    size_t big;
 
-    address_space(&fr, &big);
+    address_space(
+        &fr,
+        &big
+    );
 
     g_log(
         "memory: %s of %lu KB FAILED "
@@ -129,9 +279,13 @@ static void failed(
         "largest free block %u MB)%s",
 
         what,
+
         (unsigned long)(n >> 10),
+
         err,
+
         (unsigned)(fr >> 20),
+
         (unsigned)(big >> 20),
 
         !g_trim
@@ -155,7 +309,14 @@ static LPVOID WINAPI h_MapViewOfFile(
     SIZE_T n
 )
 {
-    LPVOID p = o_MapViewOfFile(h, acc, hi, lo, n);
+    LPVOID p =
+        o_MapViewOfFile(
+            h,
+            acc,
+            hi,
+            lo,
+            n
+        );
 
     if (p)
         return p;
@@ -163,9 +324,17 @@ static LPVOID WINAPI h_MapViewOfFile(
     DWORD err = GetLastError();
 
     if (g_trim) {
+
         g_trim();
 
-        p = o_MapViewOfFile(h, acc, hi, lo, n);
+        p =
+            o_MapViewOfFile(
+                h,
+                acc,
+                hi,
+                lo,
+                n
+            );
     }
 
     failed(
@@ -186,9 +355,12 @@ static LPVOID WINAPI h_MapViewOfFile(
 // VirtualAlloc hook
 // ------------------------------------------------------------
 //
-// The game's heap calls VirtualAlloc while holding its lock.
-// Therefore this hook only logs failures and diagnostics.
-// It does not call g_trim().
+// The game's heap can call VirtualAlloc while holding its lock.
+//
+// Therefore:
+//
+//   * no g_trim() here
+//   * diagnostics only
 //
 
 static LPVOID WINAPI h_VirtualAlloc(
@@ -198,49 +370,69 @@ static LPVOID WINAPI h_VirtualAlloc(
     DWORD prot
 )
 {
-    LPVOID p = o_VirtualAlloc(a, n, type, prot);
+    size_t before_free = 0;
+    size_t before_big = 0;
+
+    int large =
+        n >= LARGE_ALLOC_BYTES;
+
+    if (large) {
+
+        address_space(
+            &before_free,
+            &before_big
+        );
+    }
+
+
+    LPVOID p =
+        o_VirtualAlloc(
+            a,
+            n,
+            type,
+            prot
+        );
 
 
     // --------------------------------------------------------
-    // Log successful large allocations
+    // Successful large allocation
     // --------------------------------------------------------
 
     if (
         p != NULL &&
-        n >= LARGE_ALLOC_BYTES
+        large
     ) {
-        size_t fr, big;
+        void *caller =
+            _ReturnAddress();
 
-        address_space(&fr, &big);
+        log_space_change(
+            "VirtualAlloc OK",
 
-        g_log(
-            "memory: VirtualAlloc OK - %lu KB at %p "
-            "(type 0x%08lX, protect 0x%08lX; "
-            "address space %u MB free, "
-            "largest free block %u MB)",
+            n,
 
-            (unsigned long)(n >> 10),
             p,
-            (unsigned long)type,
-            (unsigned long)prot,
-            (unsigned)(fr >> 20),
-            (unsigned)(big >> 20)
+
+            type,
+
+            prot,
+
+            before_free,
+
+            before_big,
+
+            caller
         );
     }
 
 
     // With a specific address requested, failure can be normal.
     // The game uses this behaviour for probing.
+
     if (p || a)
         return p;
 
 
-    // Reserve-only:
-    //
-    // The game's free-address probe before a file map uses this.
-    // Its failure is followed by the map, which is already logged.
-    //
-    // Do not count this as a normal allocation failure.
+    // Reserve-only failures are often part of probing.
 
     if (!(type & MEM_COMMIT))
         return p;
@@ -256,19 +448,33 @@ static LPVOID WINAPI h_VirtualAlloc(
         InterlockedIncrement(&g_va_logged)
         <= MAX_FAIL_LOGS / 2
     ) {
-        size_t fr, big;
+        size_t fr;
+        size_t big;
 
-        address_space(&fr, &big);
+        address_space(
+            &fr,
+            &big
+        );
 
         g_log(
             "memory: game VirtualAlloc of %lu KB FAILED "
-            "(error %lu; address space %u MB free, "
-            "largest free block %u MB)",
+            "(type 0x%08lX, protect 0x%08lX, "
+            "error %lu; address space %u MB free, "
+            "largest free block %u MB; caller %p)",
 
             (unsigned long)(n >> 10),
+
+            (unsigned long)type,
+
+            (unsigned long)prot,
+
             err,
+
             (unsigned)(fr >> 20),
-            (unsigned)(big >> 20)
+
+            (unsigned)(big >> 20),
+
+            _ReturnAddress()
         );
     }
 
@@ -282,11 +488,10 @@ static LPVOID WINAPI h_VirtualAlloc(
 // VirtualFree hook
 // ------------------------------------------------------------
 //
-// Important:
+// For MEM_RELEASE Windows normally requires dwSize = 0.
 //
-// For MEM_RELEASE, Windows normally requires dwSize = 0.
-// Therefore we use VirtualQuery BEFORE freeing the allocation
-// to determine the size of the allocation.
+// Therefore VirtualQuery is used before the call to determine
+// the region size.
 //
 
 static BOOL WINAPI h_VirtualFree(
@@ -296,7 +501,6 @@ static BOOL WINAPI h_VirtualFree(
 )
 {
     SIZE_T region_size = n;
-
 
     // --------------------------------------------------------
     // Determine size before MEM_RELEASE
@@ -315,41 +519,62 @@ static BOOL WINAPI h_VirtualFree(
                 sizeof(mbi)
             ) == sizeof(mbi)
         ) {
-            region_size = mbi.RegionSize;
+            region_size =
+                mbi.RegionSize;
         }
     }
 
 
-    BOOL result = o_VirtualFree(
-        a,
-        n,
-        type
-    );
+    int large =
+        region_size >= LARGE_ALLOC_BYTES;
+
+    size_t before_free = 0;
+    size_t before_big = 0;
+
+    if (large) {
+
+        address_space(
+            &before_free,
+            &before_big
+        );
+    }
+
+
+    BOOL result =
+        o_VirtualFree(
+            a,
+            n,
+            type
+        );
 
 
     // --------------------------------------------------------
-    // Log successful large frees
+    // Successful large free
     // --------------------------------------------------------
 
     if (
         result &&
-        region_size >= LARGE_ALLOC_BYTES
+        large
     ) {
-        size_t fr, big;
+        void *caller =
+            _ReturnAddress();
 
-        address_space(&fr, &big);
+        log_space_change(
+            "VirtualFree OK",
 
-        g_log(
-            "memory: VirtualFree OK - %lu KB at %p "
-            "(type 0x%08lX; "
-            "address space %u MB free, "
-            "largest free block %u MB)",
+            region_size,
 
-            (unsigned long)(region_size >> 10),
             a,
-            (unsigned long)type,
-            (unsigned)(fr >> 20),
-            (unsigned)(big >> 20)
+
+            type,
+
+            0,
+
+            before_free,
+
+            before_big,
+
+            caller
         );
     }
 
@@ -362,7 +587,9 @@ static BOOL WINAPI h_VirtualFree(
 // Low-water monitor
 // ------------------------------------------------------------
 
-static DWORD WINAPI low_water(LPVOID arg)
+static DWORD WINAPI low_water(
+    LPVOID arg
+)
 {
     (void)arg;
 
@@ -375,21 +602,29 @@ static DWORD WINAPI low_water(LPVOID arg)
 
     unsigned next = 0;
 
-    while (next < sizeof marks / sizeof *marks) {
-
+    while (
+        next <
+        sizeof marks / sizeof *marks
+    ) {
         Sleep(5000);
 
-        size_t fr, big;
+        size_t fr;
+        size_t big;
 
-        address_space(&fr, &big);
+        address_space(
+            &fr,
+            &big
+        );
 
-        unsigned mb = (unsigned)(big >> 20);
+        unsigned mb =
+            (unsigned)(big >> 20);
 
         if (mb >= marks[next])
             continue;
 
         while (
-            next < sizeof marks / sizeof *marks &&
+            next <
+            sizeof marks / sizeof *marks &&
             mb < marks[next]
         ) {
             next++;
@@ -401,6 +636,7 @@ static DWORD WINAPI low_water(LPVOID arg)
             "%u MB free in all%s",
 
             mb,
+
             (unsigned)(fr >> 20),
 
             mb < 128
@@ -418,7 +654,6 @@ static DWORD WINAPI low_water(LPVOID arg)
 // ------------------------------------------------------------
 //
 // The game DLL's import of KERNEL32!name now goes to `to`.
-// Returns the old target or NULL.
 //
 
 static void *iat_swap(
@@ -427,11 +662,13 @@ static void *iat_swap(
     void *to
 )
 {
-    unsigned char *b = (unsigned char *)m;
+    unsigned char *b =
+        (unsigned char *)m;
 
     IMAGE_NT_HEADERS *nt =
         (IMAGE_NT_HEADERS *)(
-            b + ((IMAGE_DOS_HEADER *)b)->e_lfanew
+            b +
+            ((IMAGE_DOS_HEADER *)b)->e_lfanew
         );
 
     IMAGE_DATA_DIRECTORY *dd =
@@ -478,6 +715,7 @@ static void *iat_swap(
         for (
             ;
             names->u1.AddressOfData;
+
             names++,
             iat++
         ) {
@@ -496,9 +734,11 @@ static void *iat_swap(
                         (
                             IMAGE_IMPORT_BY_NAME *
                         )(
-                            b + names->u1.AddressOfData
+                            b +
+                            names->u1.AddressOfData
                         )
                     )->Name,
+
                     name
                 ) != 0
             ) {
@@ -511,13 +751,16 @@ static void *iat_swap(
 
             DWORD prot;
 
-
             if (
                 !old ||
+
                 !VirtualProtect(
                     &iat->u1.Function,
+
                     sizeof(void *),
+
                     PAGE_READWRITE,
+
                     &prot
                 )
             ) {
@@ -531,8 +774,11 @@ static void *iat_swap(
 
             VirtualProtect(
                 &iat->u1.Function,
+
                 sizeof(void *),
+
                 prot,
+
                 &prot
             );
 
@@ -554,7 +800,10 @@ static void *iat_swap(
 int install_memwatch(
     HMODULE m,
     void (*trim)(void),
-    void (*log)(const char *fmt, ...)
+    void (*log)(
+        const char *fmt,
+        ...
+    )
 )
 {
     g_log = log;
@@ -562,8 +811,8 @@ int install_memwatch(
     g_trim = trim;
 
 
-    // Set the original functions before swapping the IAT.
-    // Another thread may call into the hook immediately.
+    // Set original functions before swapping the IAT.
+    // Another thread may enter a hook immediately.
 
     HMODULE k =
         GetModuleHandleW(
@@ -577,13 +826,11 @@ int install_memwatch(
             "MapViewOfFile"
         );
 
-
     o_VirtualAlloc =
         (void *)GetProcAddress(
             k,
             "VirtualAlloc"
         );
-
 
     o_VirtualFree =
         (void *)GetProcAddress(
@@ -604,11 +851,14 @@ int install_memwatch(
     if (
         (was = iat_swap(
             m,
+
             "MapViewOfFile",
+
             (void *)h_MapViewOfFile
         ))
     ) {
         o_MapViewOfFile = was;
+
         n++;
     }
 
@@ -616,11 +866,14 @@ int install_memwatch(
     if (
         (was = iat_swap(
             m,
+
             "VirtualAlloc",
+
             (void *)h_VirtualAlloc
         ))
     ) {
         o_VirtualAlloc = was;
+
         n++;
     }
 
@@ -628,26 +881,34 @@ int install_memwatch(
     if (
         (was = iat_swap(
             m,
+
             "VirtualFree",
+
             (void *)h_VirtualFree
         ))
     ) {
         o_VirtualFree = was;
+
         n++;
     }
 
 
     // --------------------------------------------------------
-    // Start address-space low-water monitor
+    // Start low-water monitor
     // --------------------------------------------------------
 
     HANDLE t =
         CreateThread(
             NULL,
+
             0,
+
             low_water,
+
             NULL,
+
             0,
+
             NULL
         );
 
@@ -659,7 +920,8 @@ int install_memwatch(
     // Initial statistics
     // --------------------------------------------------------
 
-    size_t fr, big;
+    size_t fr;
+    size_t big;
 
     address_space(
         &fr,
@@ -669,19 +931,20 @@ int install_memwatch(
 
     log(
         "memory watch: %d of 3 game imports watched "
-        "(file maps, VirtualAlloc, VirtualFree)%s; "
+        "(file maps, VirtualAlloc, VirtualFree); "
         "large allocations/frees >= %u MB logged; "
+        "fragmentation drops >= %u MB highlighted; "
         "address space now %u MB free, "
         "largest free block %u MB",
 
         n,
 
-        trim
-            ? ", spare memory freed and retried on a failure"
-            : "",
-
         (unsigned)LARGE_ALLOC_MB,
+
+        (unsigned)FRAGMENT_DROP_MB,
+
         (unsigned)(fr >> 20),
+
         (unsigned)(big >> 20)
     );
 
