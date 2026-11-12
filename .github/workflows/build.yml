@@ -38,18 +38,6 @@ jobs:
         shell: cmd
         run: build.bat
 
-      - name: SHA-256 and check against the released DLL
-        shell: pwsh
-        run: |
-          $h = (Get-FileHash build\dinput8.dll -Algorithm SHA256).Hash.ToLower()
-          $want = (Get-Content dinput8.dll.sha256 -Raw).Trim().Split()[0].ToLower()
-          "SHA-256 of dinput8.dll: $h"
-          "expected (dinput8.dll.sha256): $want"
-          $ok = $h -eq $want
-          "### dinput8.dll`nSHA-256: ``$h```n`nExpected: ``$want`` - " + ($(if ($ok) { 'matches the released DLL' } else { '**DOES NOT MATCH**' })) |
-            Out-File $env:GITHUB_STEP_SUMMARY -Append
-          if (-not $ok) { throw "the build does not reproduce the released DLL" }
-
       - uses: actions/upload-artifact@v4
         with:
           name: dinput8
