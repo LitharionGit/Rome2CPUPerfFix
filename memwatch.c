@@ -403,7 +403,7 @@ static LPVOID WINAPI h_VirtualAlloc(
         large
     ) {
         void *caller =
-            _ReturnAddress();
+            __builtin_return_address(0);
 
         log_space_change(
             "VirtualAlloc OK",
@@ -474,7 +474,7 @@ static LPVOID WINAPI h_VirtualAlloc(
 
             (unsigned)(big >> 20),
 
-            _ReturnAddress()
+            __builtin_return_address(0)
         );
     }
 
@@ -557,7 +557,7 @@ static BOOL WINAPI h_VirtualFree(
         large
     ) {
         void *caller =
-            _ReturnAddress();
+            __builtin_return_address(0);
 
         log_space_change(
             "VirtualFree OK",
