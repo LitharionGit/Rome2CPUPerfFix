@@ -392,6 +392,7 @@ static DWORD WINAPI address_space_scanner(LPVOID arg)
     (void)arg;
     scan_snapshot current;
     int f10_was_down = 0;
+    DWORD next_scan;
 
     take_snapshot(&g_scan_previous);
     InterlockedExchange(&g_scan_ready, 1);
@@ -403,19 +404,35 @@ static DWORD WINAPI address_space_scanner(LPVOID arg)
           (unsigned)ADDRESS_SCAN_MS);
     log_largest_free_block(&g_scan_previous);
 
+    next_scan = GetTickCount() + ADDRESS_SCAN_MS;
+
     for (;;) {
         unsigned i;
         size_t old_free, new_free, old_big, new_big, free_change, big_change;
+        DWORD now;
 
-        Sleep(ADDRESS_SCAN_MS);
-        take_snapshot(&current);
+        /*
+         * Poll F10 frequently. The old implementation checked only once
+         * every ADDRESS_SCAN_MS milliseconds, so a normal short key press
+         * was very easy to miss.
+         */
+        Sleep(50);
 
         {
             int f10_now = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-            if (f10_now && !f10_was_down)
+            if (f10_now && !f10_was_down) {
+                take_snapshot(&current);
                 capture_manual_baseline(&current);
+            }
             f10_was_down = f10_now;
         }
+
+        now = GetTickCount();
+        if ((LONG)(now - next_scan) < 0)
+            continue;
+
+        next_scan = now + ADDRESS_SCAN_MS;
+        take_snapshot(&current);
 
         old_free = g_scan_previous.free_total;
         new_free = current.free_total;
