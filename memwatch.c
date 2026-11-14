@@ -150,510 +150,320 @@ static void address_space(
 // ------------------------------------------------------------
 // Address-space scanner
 // ------------------------------------------------------------
+//
+// Diagnostic only. Press F10 in a stable campaign state to capture
+// a manual baseline. Later scans compare against that baseline.
 
 typedef struct scan_region {
-
     ULONG_PTR base;
-
     SIZE_T size;
-
     DWORD state;
-
     DWORD type;
-
     DWORD protect;
-
 } scan_region;
 
-
 typedef struct scan_snapshot {
-
     scan_region regions[MAX_SCAN_REGIONS];
-
     unsigned count;
-
     size_t free_total;
-
     size_t largest_free;
-
+    ULONG_PTR largest_free_base;
+    ULONG_PTR largest_free_end;
+    scan_region left_boundary;
+    scan_region right_boundary;
+    int have_left_boundary;
+    int have_right_boundary;
 } scan_snapshot;
 
-
 static scan_snapshot g_scan_previous;
-
+static scan_snapshot g_scan_baseline;
 static volatile LONG g_scan_ready;
+static volatile LONG g_manual_baseline_ready;
 
-
-// ------------------------------------------------------------
-// Human-readable memory type
-// ------------------------------------------------------------
-
-static const char *memory_type_name(
-    DWORD type
-)
+static const char *memory_type_name(DWORD type)
 {
     switch (type) {
-
-    case MEM_PRIVATE:
-        return "MEM_PRIVATE";
-
-    case MEM_MAPPED:
-        return "MEM_MAPPED";
-
-    case MEM_IMAGE:
-        return "MEM_IMAGE";
-
-    default:
-        return "UNKNOWN";
+    case MEM_PRIVATE: return "MEM_PRIVATE";
+    case MEM_MAPPED:  return "MEM_MAPPED";
+    case MEM_IMAGE:   return "MEM_IMAGE";
+    default:          return "UNKNOWN";
     }
 }
 
-
-// ------------------------------------------------------------
-// Human-readable memory state
-// ------------------------------------------------------------
-
-static const char *memory_state_name(
-    DWORD state
-)
+static const char *memory_state_name(DWORD state)
 {
     switch (state) {
-
-    case MEM_COMMIT:
-        return "MEM_COMMIT";
-
-    case MEM_RESERVE:
-        return "MEM_RESERVE";
-
-    case MEM_FREE:
-        return "MEM_FREE";
-
-    default:
-        return "UNKNOWN";
+    case MEM_COMMIT:  return "MEM_COMMIT";
+    case MEM_RESERVE: return "MEM_RESERVE";
+    case MEM_FREE:    return "MEM_FREE";
+    default:          return "UNKNOWN";
     }
 }
 
+static ULONG_PTR region_end(const scan_region *r)
+{
+    return r->base + (ULONG_PTR)r->size;
+}
 
-// ------------------------------------------------------------
-// Take address-space snapshot
-// ------------------------------------------------------------
-
-static void take_snapshot(
-    scan_snapshot *snapshot
-)
+static void take_snapshot(scan_snapshot *snapshot)
 {
     MEMORY_BASIC_INFORMATION m;
+    scan_region previous_nonfree;
+    int have_previous_nonfree = 0;
 
     snapshot->count = 0;
-
     snapshot->free_total = 0;
-
     snapshot->largest_free = 0;
-
+    snapshot->largest_free_base = 0;
+    snapshot->largest_free_end = 0;
+    snapshot->have_left_boundary = 0;
+    snapshot->have_right_boundary = 0;
 
     for (
-        unsigned char *a =
-            (unsigned char *)0x10000;
-
-        VirtualQuery(
-            a,
-            &m,
-            sizeof m
-        ) == sizeof m;
-
-        a =
-            (unsigned char *)m.BaseAddress +
-            m.RegionSize
+        unsigned char *a = (unsigned char *)0x10000;
+        VirtualQuery(a, &m, sizeof m) == sizeof m;
+        a = (unsigned char *)m.BaseAddress + m.RegionSize
     ) {
-
         if (m.State == MEM_FREE) {
-
-            snapshot->free_total +=
-                m.RegionSize;
-
-            if (
-                m.RegionSize >
-                snapshot->largest_free
-            ) {
-                snapshot->largest_free =
-                    m.RegionSize;
+            snapshot->free_total += m.RegionSize;
+            if (m.RegionSize > snapshot->largest_free) {
+                snapshot->largest_free = m.RegionSize;
+                snapshot->largest_free_base = (ULONG_PTR)m.BaseAddress;
+                snapshot->largest_free_end = (ULONG_PTR)m.BaseAddress + (ULONG_PTR)m.RegionSize;
+                snapshot->have_left_boundary = have_previous_nonfree;
+                if (have_previous_nonfree)
+                    snapshot->left_boundary = previous_nonfree;
+                snapshot->have_right_boundary = 0;
             }
+        } else {
+            scan_region r;
+            r.base = (ULONG_PTR)m.BaseAddress;
+            r.size = m.RegionSize;
+            r.state = m.State;
+            r.type = m.Type;
+            r.protect = m.Protect;
+
+            if (snapshot->largest_free && snapshot->largest_free_end == r.base) {
+                snapshot->right_boundary = r;
+                snapshot->have_right_boundary = 1;
+            }
+
+            previous_nonfree = r;
+            have_previous_nonfree = 1;
+
+            if (m.RegionSize >= SCAN_REGION_BYTES && snapshot->count < MAX_SCAN_REGIONS)
+                snapshot->regions[snapshot->count++] = r;
         }
 
-
-        // Remember sufficiently large non-free regions.
-        //
-        // This allows us to detect:
-        //
-        //   * new large private allocations
-        //   * new mapped files
-        //   * large images
-        //
-        // even when they did not pass through our hooks.
-
-        if (
-            m.State != MEM_FREE &&
-            m.RegionSize >= SCAN_REGION_BYTES &&
-            snapshot->count <
-                MAX_SCAN_REGIONS
-        ) {
-
-            scan_region *r =
-                &snapshot->regions[
-                    snapshot->count++
-                ];
-
-            r->base =
-                (ULONG_PTR)m.BaseAddress;
-
-            r->size =
-                m.RegionSize;
-
-            r->state =
-                m.State;
-
-            r->type =
-                m.Type;
-
-            r->protect =
-                m.Protect;
-        }
-
-
-        // Overflow protection.
-
-        if (
-            (unsigned char *)m.BaseAddress +
-            m.RegionSize < a
-        ) {
+        if ((unsigned char *)m.BaseAddress + m.RegionSize < a)
             break;
-        }
     }
 }
 
-
-// ------------------------------------------------------------
-// Compare two regions
-// ------------------------------------------------------------
-
-static int same_region(
-    const scan_region *a,
-    const scan_region *b
-)
+static int same_region(const scan_region *a, const scan_region *b)
 {
-    return
-
-        a->base == b->base &&
-
-        a->size == b->size &&
-
-        a->state == b->state &&
-
-        a->type == b->type &&
-
-        a->protect == b->protect;
+    return a->base == b->base && a->size == b->size &&
+           a->state == b->state && a->type == b->type &&
+           a->protect == b->protect;
 }
 
-
-// ------------------------------------------------------------
-// Find region in snapshot
-// ------------------------------------------------------------
-
-static int snapshot_contains(
-    const scan_snapshot *snapshot,
-    const scan_region *region
-)
+static int snapshot_contains(const scan_snapshot *snapshot, const scan_region *region)
 {
     unsigned i;
-
-    for (
-        i = 0;
-        i < snapshot->count;
-        i++
-    ) {
-
-        if (
-            same_region(
-                &snapshot->regions[i],
-                region
-            )
-        ) {
+    for (i = 0; i < snapshot->count; i++)
+        if (same_region(&snapshot->regions[i], region))
             return 1;
-        }
-    }
-
     return 0;
 }
 
-
-// ------------------------------------------------------------
-// Log new large region
-// ------------------------------------------------------------
-
-static void log_new_region(
-    const scan_region *r
-)
+static const scan_region *snapshot_find_base(const scan_snapshot *snapshot, ULONG_PTR base)
 {
-    g_log(
-        "memory: NEW LARGE REGION "
-        "%lu KB at %08lX "
-        "(%s, %s, protect 0x%08lX)",
-
-        (unsigned long)(
-            r->size >> 10
-        ),
-
-        (unsigned long)r->base,
-
-        memory_state_name(
-            r->state
-        ),
-
-        memory_type_name(
-            r->type
-        ),
-
-        (unsigned long)r->protect
-    );
+    unsigned i;
+    for (i = 0; i < snapshot->count; i++)
+        if (snapshot->regions[i].base == base)
+            return &snapshot->regions[i];
+    return NULL;
 }
 
-
-// ------------------------------------------------------------
-// Log removed large region
-// ------------------------------------------------------------
-
-static void log_removed_region(
-    const scan_region *r
-)
+static void log_largest_free_block(const scan_snapshot *s)
 {
-    g_log(
-        "memory: LARGE REGION REMOVED "
-        "%lu KB at %08lX "
-        "(%s, %s, protect 0x%08lX)",
+    g_log("memory: LARGEST FREE BLOCK %08lX-%08lX (%u MB)",
+          (unsigned long)s->largest_free_base,
+          (unsigned long)s->largest_free_end,
+          (unsigned)(s->largest_free >> 20));
 
-        (unsigned long)(
-            r->size >> 10
-        ),
+    if (s->have_left_boundary)
+        g_log("memory: LARGEST BLOCK LEFT BOUNDARY %08lX-%08lX (%lu KB, %s, %s, protect 0x%08lX)",
+              (unsigned long)s->left_boundary.base,
+              (unsigned long)region_end(&s->left_boundary),
+              (unsigned long)(s->left_boundary.size >> 10),
+              memory_state_name(s->left_boundary.state),
+              memory_type_name(s->left_boundary.type),
+              (unsigned long)s->left_boundary.protect);
+    else
+        g_log("memory: LARGEST BLOCK LEFT BOUNDARY none");
 
-        (unsigned long)r->base,
-
-        memory_state_name(
-            r->state
-        ),
-
-        memory_type_name(
-            r->type
-        ),
-
-        (unsigned long)r->protect
-    );
+    if (s->have_right_boundary)
+        g_log("memory: LARGEST BLOCK RIGHT BOUNDARY %08lX-%08lX (%lu KB, %s, %s, protect 0x%08lX)",
+              (unsigned long)s->right_boundary.base,
+              (unsigned long)region_end(&s->right_boundary),
+              (unsigned long)(s->right_boundary.size >> 10),
+              memory_state_name(s->right_boundary.state),
+              memory_type_name(s->right_boundary.type),
+              (unsigned long)s->right_boundary.protect);
+    else
+        g_log("memory: LARGEST BLOCK RIGHT BOUNDARY none");
 }
 
+static void log_new_region(const scan_region *r)
+{
+    g_log("memory: NEW LARGE REGION %lu KB at %08lX (%s, %s, protect 0x%08lX)",
+          (unsigned long)(r->size >> 10), (unsigned long)r->base,
+          memory_state_name(r->state), memory_type_name(r->type),
+          (unsigned long)r->protect);
+}
 
-// ------------------------------------------------------------
-// Address-space scanner thread
-// ------------------------------------------------------------
+static void log_removed_region(const scan_region *r)
+{
+    g_log("memory: LARGE REGION REMOVED %lu KB at %08lX (%s, %s, protect 0x%08lX)",
+          (unsigned long)(r->size >> 10), (unsigned long)r->base,
+          memory_state_name(r->state), memory_type_name(r->type),
+          (unsigned long)r->protect);
+}
 
-static DWORD WINAPI address_space_scanner(
-    LPVOID arg
-)
+static void log_changed_region(const scan_region *old, const scan_region *now)
+{
+    g_log("memory: LARGE REGION CHANGED at %08lX size %lu KB -> %lu KB, state %s -> %s, type %s -> %s, protect 0x%08lX -> 0x%08lX",
+          (unsigned long)now->base,
+          (unsigned long)(old->size >> 10), (unsigned long)(now->size >> 10),
+          memory_state_name(old->state), memory_state_name(now->state),
+          memory_type_name(old->type), memory_type_name(now->type),
+          (unsigned long)old->protect, (unsigned long)now->protect);
+}
+
+static void capture_manual_baseline(const scan_snapshot *current)
+{
+    g_scan_baseline = *current;
+    InterlockedExchange(&g_manual_baseline_ready, 1);
+
+    g_log("memory: F10 BASELINE CAPTURED; %u large regions >= %u MB; %u MB free, largest block %u MB",
+          current->count, (unsigned)SCAN_REGION_MB,
+          (unsigned)(current->free_total >> 20),
+          (unsigned)(current->largest_free >> 20));
+    log_largest_free_block(current);
+}
+
+static void log_persistent_regions(const scan_snapshot *current)
+{
+    unsigned i, count = 0;
+    SIZE_T total = 0;
+
+    for (i = 0; i < current->count; i++) {
+        const scan_region *r = &current->regions[i];
+        const scan_region *old;
+
+        if (snapshot_contains(&g_scan_baseline, r))
+            continue;
+
+        old = snapshot_find_base(&g_scan_baseline, r->base);
+        if (old)
+            continue; // changed baseline region, not newly added memory
+
+        count++;
+        total += r->size;
+        g_log("memory: PERSISTING SINCE F10 BASELINE %lu KB at %08lX (%s, %s, protect 0x%08lX)",
+              (unsigned long)(r->size >> 10), (unsigned long)r->base,
+              memory_state_name(r->state), memory_type_name(r->type),
+              (unsigned long)r->protect);
+    }
+
+    g_log("memory: PERSISTENT NEW REGIONS SINCE F10 %u regions, %u MB total; baseline free %u MB -> now %u MB [%+ld MB], largest block %u MB -> %u MB [%+ld MB]",
+          count, (unsigned)(total >> 20),
+          (unsigned)(g_scan_baseline.free_total >> 20),
+          (unsigned)(current->free_total >> 20),
+          (long)(current->free_total >> 20) - (long)(g_scan_baseline.free_total >> 20),
+          (unsigned)(g_scan_baseline.largest_free >> 20),
+          (unsigned)(current->largest_free >> 20),
+          (long)(current->largest_free >> 20) - (long)(g_scan_baseline.largest_free >> 20));
+}
+
+static DWORD WINAPI address_space_scanner(LPVOID arg)
 {
     (void)arg;
-
     scan_snapshot current;
+    int f10_was_down = 0;
 
+    take_snapshot(&g_scan_previous);
+    InterlockedExchange(&g_scan_ready, 1);
 
-    // --------------------------------------------------------
-    // Establish baseline
-    // --------------------------------------------------------
-
-    take_snapshot(
-        &g_scan_previous
-    );
-
-    InterlockedExchange(
-        &g_scan_ready,
-        1
-    );
-
-
-    g_log(
-        "memory scanner: baseline captured; "
-        "%u large regions >= %u MB; "
-        "%u MB free, largest block %u MB; "
-        "scan interval %u ms",
-
-        g_scan_previous.count,
-
-        (unsigned)SCAN_REGION_MB,
-
-        (unsigned)(
-            g_scan_previous.free_total >> 20
-        ),
-
-        (unsigned)(
-            g_scan_previous.largest_free >> 20
-        ),
-
-        (unsigned)ADDRESS_SCAN_MS
-    );
-
-
-    // --------------------------------------------------------
-    // Periodic scans
-    // --------------------------------------------------------
+    g_log("memory scanner: initial snapshot captured; %u large regions >= %u MB; %u MB free, largest block %u MB; scan interval %u ms; press F10 in a stable campaign state to capture baseline",
+          g_scan_previous.count, (unsigned)SCAN_REGION_MB,
+          (unsigned)(g_scan_previous.free_total >> 20),
+          (unsigned)(g_scan_previous.largest_free >> 20),
+          (unsigned)ADDRESS_SCAN_MS);
+    log_largest_free_block(&g_scan_previous);
 
     for (;;) {
+        unsigned i;
+        size_t old_free, new_free, old_big, new_big, free_change, big_change;
 
-        Sleep(
-            ADDRESS_SCAN_MS
-        );
-
-
-        take_snapshot(
-            &current
-        );
-
-
-        // ----------------------------------------------------
-        // Overall address-space change
-        // ----------------------------------------------------
+        Sleep(ADDRESS_SCAN_MS);
+        take_snapshot(&current);
 
         {
-            size_t old_free =
-                g_scan_previous.free_total;
-
-            size_t new_free =
-                current.free_total;
-
-            size_t old_big =
-                g_scan_previous.largest_free;
-
-            size_t new_big =
-                current.largest_free;
-
-
-            size_t free_change =
-                old_free > new_free
-                    ? old_free - new_free
-                    : new_free - old_free;
-
-            size_t big_change =
-                old_big > new_big
-                    ? old_big - new_big
-                    : new_big - old_big;
-
-
-            if (
-                free_change >=
-                    SCAN_CHANGE_BYTES ||
-
-                big_change >=
-                    SCAN_CHANGE_BYTES
-            ) {
-
-                long free_delta_mb =
-                    (long)(new_free >> 20) -
-                    (long)(old_free >> 20);
-
-                long big_delta_mb =
-                    (long)(new_big >> 20) -
-                    (long)(old_big >> 20);
-
-
-                g_log(
-                    "memory: ADDRESS SPACE CHANGE "
-                    "free %u MB -> %u MB [%+ld MB], "
-                    "largest block %u MB -> %u MB [%+ld MB]",
-
-                    (unsigned)(
-                        old_free >> 20
-                    ),
-
-                    (unsigned)(
-                        new_free >> 20
-                    ),
-
-                    free_delta_mb,
-
-                    (unsigned)(
-                        old_big >> 20
-                    ),
-
-                    (unsigned)(
-                        new_big >> 20
-                    ),
-
-                    big_delta_mb
-                );
-            }
+            int f10_now = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+            if (f10_now && !f10_was_down)
+                capture_manual_baseline(&current);
+            f10_was_down = f10_now;
         }
 
+        old_free = g_scan_previous.free_total;
+        new_free = current.free_total;
+        old_big = g_scan_previous.largest_free;
+        new_big = current.largest_free;
+        free_change = old_free > new_free ? old_free - new_free : new_free - old_free;
+        big_change = old_big > new_big ? old_big - new_big : new_big - old_big;
 
-        // ----------------------------------------------------
-        // New large regions
-        // ----------------------------------------------------
-
-        {
-            unsigned i;
-
-            for (
-                i = 0;
-                i < current.count;
-                i++
-            ) {
-
-                if (
-                    !snapshot_contains(
-                        &g_scan_previous,
-                        &current.regions[i]
-                    )
-                ) {
-
-                    log_new_region(
-                        &current.regions[i]
-                    );
-                }
-            }
+        if (free_change >= SCAN_CHANGE_BYTES || big_change >= SCAN_CHANGE_BYTES) {
+            g_log("memory: ADDRESS SPACE CHANGE free %u MB -> %u MB [%+ld MB], largest block %u MB -> %u MB [%+ld MB]",
+                  (unsigned)(old_free >> 20), (unsigned)(new_free >> 20),
+                  (long)(new_free >> 20) - (long)(old_free >> 20),
+                  (unsigned)(old_big >> 20), (unsigned)(new_big >> 20),
+                  (long)(new_big >> 20) - (long)(old_big >> 20));
+            if (big_change >= SCAN_CHANGE_BYTES)
+                log_largest_free_block(&current);
         }
 
-
-        // ----------------------------------------------------
-        // Removed large regions
-        // ----------------------------------------------------
-
-        {
-            unsigned i;
-
-            for (
-                i = 0;
-                i < g_scan_previous.count;
-                i++
-            ) {
-
-                if (
-                    !snapshot_contains(
-                        &current,
-                        &g_scan_previous.regions[i]
-                    )
-                ) {
-
-                    log_removed_region(
-                        &g_scan_previous.regions[i]
-                    );
-                }
-            }
+        for (i = 0; i < current.count; i++) {
+            const scan_region *r = &current.regions[i];
+            const scan_region *old;
+            if (snapshot_contains(&g_scan_previous, r))
+                continue;
+            old = snapshot_find_base(&g_scan_previous, r->base);
+            if (old) log_changed_region(old, r);
+            else log_new_region(r);
         }
 
+        for (i = 0; i < g_scan_previous.count; i++) {
+            const scan_region *r = &g_scan_previous.regions[i];
+            if (snapshot_contains(&current, r))
+                continue;
+            if (snapshot_find_base(&current, r->base))
+                continue;
+            log_removed_region(r);
+        }
 
-        // Replace old snapshot.
+        if (InterlockedCompareExchange(&g_manual_baseline_ready, 0, 0)) {
+            size_t bf = g_scan_baseline.free_total;
+            size_t bb = g_scan_baseline.largest_free;
+            size_t df = bf > current.free_total ? bf - current.free_total : current.free_total - bf;
+            size_t db = bb > current.largest_free ? bb - current.largest_free : current.largest_free - bb;
+            if (df >= SCAN_CHANGE_BYTES || db >= SCAN_CHANGE_BYTES)
+                log_persistent_regions(&current);
+        }
 
-        g_scan_previous =
-            current;
+        g_scan_previous = current;
     }
-
-
-    return 0;
 }
 
 // ------------------------------------------------------------
