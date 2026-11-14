@@ -36,6 +36,17 @@
 #include <stdio.h>
 #include <string.h>
 
+// ------------------------------------------------------------
+// Globals
+// ------------------------------------------------------------
+
+static void (*g_log)(
+    const char *fmt,
+    ...
+);
+
+static void (*g_trim)(void);
+
 
 // ------------------------------------------------------------
 // Configuration
@@ -644,19 +655,6 @@ static DWORD WINAPI address_space_scanner(
 
     return 0;
 }
-
-
-// ------------------------------------------------------------
-// Globals
-// ------------------------------------------------------------
-
-static void (*g_log)(
-    const char *fmt,
-    ...
-);
-
-static void (*g_trim)(void);
-
 
 // ------------------------------------------------------------
 // Original imported functions
