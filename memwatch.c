@@ -200,6 +200,98 @@ static const char *memory_state_name(DWORD state)
     }
 }
 
+
+typedef DWORD (WINAPI *GetMappedFileNameW_t)(
+    HANDLE,
+    LPVOID,
+    LPWSTR,
+    DWORD
+);
+
+static void log_mapped_file(
+    ULONG_PTR address
+)
+{
+    static GetMappedFileNameW_t pGetMappedFileNameW;
+    static LONG initialized;
+
+    wchar_t path[MAX_PATH];
+    char utf8[MAX_PATH * 3];
+
+    if (
+        InterlockedCompareExchange(
+            &initialized,
+            1,
+            0
+        ) == 0
+    ) {
+        HMODULE psapi =
+            GetModuleHandleW(L"psapi.dll");
+
+        if (!psapi)
+            psapi = LoadLibraryW(L"psapi.dll");
+
+        if (psapi) {
+            pGetMappedFileNameW =
+                (GetMappedFileNameW_t)GetProcAddress(
+                    psapi,
+                    "GetMappedFileNameW"
+                );
+        }
+    }
+
+    if (!pGetMappedFileNameW) {
+        g_log(
+            "memory: mapped file lookup unavailable"
+        );
+        return;
+    }
+
+    DWORD length =
+        pGetMappedFileNameW(
+            GetCurrentProcess(),
+            (LPVOID)address,
+            path,
+            MAX_PATH
+        );
+
+    if (!length) {
+        g_log(
+            "memory: mapped file unknown at %08lX",
+            (unsigned long)address
+        );
+        return;
+    }
+
+    int converted =
+        WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            path,
+            (int)length,
+            utf8,
+            (int)sizeof(utf8) - 1,
+            NULL,
+            NULL
+        );
+
+    if (converted <= 0) {
+        g_log(
+            "memory: mapped file name conversion failed at %08lX",
+            (unsigned long)address
+        );
+        return;
+    }
+
+    utf8[converted] = '\0';
+
+    g_log(
+        "memory: MAPPED FILE at %08lX: %s",
+        (unsigned long)address,
+        utf8
+    );
+}
+
 static ULONG_PTR region_end(const scan_region *r)
 {
     return r->base + (ULONG_PTR)r->size;
@@ -315,12 +407,31 @@ static void log_largest_free_block(const scan_snapshot *s)
         g_log("memory: LARGEST BLOCK RIGHT BOUNDARY none");
 }
 
-static void log_new_region(const scan_region *r)
+static void log_new_region(
+    const scan_region *r
+)
 {
-    g_log("memory: NEW LARGE REGION %lu KB at %08lX (%s, %s, protect 0x%08lX)",
-          (unsigned long)(r->size >> 10), (unsigned long)r->base,
-          memory_state_name(r->state), memory_type_name(r->type),
-          (unsigned long)r->protect);
+    g_log(
+        "memory: NEW LARGE REGION %lu KB at %08lX "
+        "(%s, %s, protect 0x%08lX)",
+
+        (unsigned long)(r->size >> 10),
+
+        (unsigned long)r->base,
+
+        memory_state_name(r->state),
+
+        memory_type_name(r->type),
+
+        (unsigned long)r->protect
+    );
+
+    if (r->type == MEM_MAPPED) {
+
+        log_mapped_file(
+            r->base
+        );
+    }
 }
 
 static void log_removed_region(const scan_region *r)
@@ -372,6 +483,12 @@ static void log_persistent_regions(const scan_snapshot *current)
         count++;
         total += r->size;
         g_log("memory: PERSISTING SINCE F10 BASELINE %lu KB at %08lX (%s, %s, protect 0x%08lX)",
+if (r->type == MEM_MAPPED) {
+
+    log_mapped_file(
+        r->base
+    );
+}            
               (unsigned long)(r->size >> 10), (unsigned long)r->base,
               memory_state_name(r->state), memory_type_name(r->type),
               (unsigned long)r->protect);
