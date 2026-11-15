@@ -482,6 +482,7 @@ static void log_persistent_regions(const scan_snapshot *current)
 
         count++;
         total += r->size;
+<<<<<<< HEAD
 
         g_log(
             "memory: PERSISTING SINCE F10 BASELINE %lu KB at %08lX (%s, %s, protect 0x%08lX)",
@@ -495,6 +496,18 @@ static void log_persistent_regions(const scan_snapshot *current)
         if (r->type == MEM_MAPPED) {
             log_mapped_file(r->base);
         }
+=======
+        g_log("memory: PERSISTING SINCE F10 BASELINE %lu KB at %08lX (%s, %s, protect 0x%08lX)",
+if (r->type == MEM_MAPPED) {
+
+    log_mapped_file(
+        r->base
+    );
+}            
+              (unsigned long)(r->size >> 10), (unsigned long)r->base,
+              memory_state_name(r->state), memory_type_name(r->type),
+              (unsigned long)r->protect);
+>>>>>>> ea915c49ceefc55f9760ec18dc9a320d3793a146
     }
 
     g_log("memory: PERSISTENT NEW REGIONS SINCE F10 %u regions, %u MB total; baseline free %u MB -> now %u MB [%+ld MB], largest block %u MB -> %u MB [%+ld MB]",
