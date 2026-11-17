@@ -1,6 +1,6 @@
 # Rome 2 Stability Fix
 
-A small `version.dll` proxy for **Total War: Rome II** that tries to stop the game from crashing while loading a battle after several battles in one session.
+The address-space stability fix integrated into this project's `dinput8.dll` proxy for **Total War: Rome II**. It tries to stop the game from crashing while loading a battle after several battles in one session.
 
 ## The problem
 
@@ -26,12 +26,12 @@ It does not change graphics or gameplay.
 
 ## Install
 
-1. Copy `version.dll` into the game folder, next to `empire.retail.dll`, for example `...\steamapps\common\Total War Rome II\`.
+1. Build the project with `build.bat` and copy `build\dinput8.dll` into the game folder, next to `empire.retail.dll`, for example `...\steamapps\common\Total War Rome II\`.
 2. Start the game. On first start the mod creates `rome2_stability.ini` and `rome2_stability.log` next to the DLL.
 
-To uninstall, delete `version.dll` (and, if you like, the `.ini` and `.log`).
+To uninstall the combined performance and stability mod, remove `dinput8.dll` (and, if you like, the `.ini` and `.log`).
 
-It can run next to a `dinput8.dll` performance mod. They use different file names.
+The stability and performance fixes are combined in this `dinput8.dll`.
 
 ## Settings
 
@@ -60,23 +60,15 @@ It can run next to a `dinput8.dll` performance mod. They use different file name
 
 ## Troubleshooting
 
-- **The game does not start:** remove `version.dll` and check that it starts without it. Then check `shader_cache_in_game=1` in the ini.
-- **No `rome2_stability.log` appears:** the DLL is not being loaded. Check that `version.dll` is in the same folder as `empire.retail.dll`.
+- **The game does not start:** remove `dinput8.dll` and check that it starts without the mod. Then check `shader_cache_in_game=1` in the ini.
+- **No `rome2_stability.log` appears:** the DLL is not being loaded. Check that the built `dinput8.dll` is in the same folder as `empire.retail.dll`.
 - **A crash:** keep the log and the newest `crash_*.dmp` the game wrote. The log masks your user name in paths, but the dump may contain more.
 
 ## Build
 
-Needs Python and the Zig compiler package (it cross-compiles 32-bit Windows DLLs, no Visual Studio needed):
-
-```powershell
-pip install ziglang
-python -m ziglang cc -target x86-windows-gnu -O2 -fno-omit-frame-pointer -shared -s -o version.dll stability.c version.def
-```
+The stability code is part of the normal 32-bit `dinput8.dll` build. Use the build instructions in `README.md`; `build.bat` compiles `stability.c` together with the existing proxy.
 
 `-fno-omit-frame-pointer` is needed, because the log reads stack frames to name the code that made a call.
-
-`stability.c` starts with a short "how it works" overview and has comments above each function.
-
 ## Known limitations
 
 - **The numbers are Attila's.** The 192 MB reserve and the 8 / 32 / 256 MB limits come from the Attila version and have not been tuned for Rome II.

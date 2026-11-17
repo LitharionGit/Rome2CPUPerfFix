@@ -1,26 +1,25 @@
-// Rome 2 Stability Fix - version.dll proxy, 32-bit. Port of the Attila Stability Fix 1.9 (xinput1_3.dll proxy).
-// FIRST TEST BUILD: the address-space fixes are the Attila ones unchanged (they only use ntdll / kernel32 and nothing of the game's own code):
+// Rome 2 Stability Fix - integrated into the 32-bit dinput8.dll proxy. Port of the Attila Stability Fix 1.9 (xinput1_3.dll proxy).
+// The address-space fixes are the Attila ones unchanged (they only use ntdll / kernel32 and nothing of the game's own code):
 // an address reserve given back when the game cannot get a big piece, big reservations from the top, big holes parked for the next big request,
 // failed mapped views logged in full, the NVIDIA shader cache kept out of the game. No graphics.
 // Differences to the Attila version:
-//  - proxy: empire.retail.dll (the real game; Rome2.exe is only a launcher) imports VERSION.dll, not XInput. Every export is passed on to the real
-//    version.dll in the system folder; until the first call they go through a one-time start-up (like the Attila one, nothing but kernel32 / ntdll in DllMain).
+//  - startup: initialized by proxy.c from the existing dinput8.dll DllMain; monitoring starts on the first DirectInput call.
 //  - the Attila battle-exit crash fix (a hook on empire.retail.dll+0x4D2700) is NOT ported: it depends on Attila's code. Add one only if Rome 2 shows the same crash.
 //  - the numbers (256 MB cap, 8 / 32 MB big-piece limits, 192 MB reserve, 350 / 96 MB rule) are the Attila ones: tune them after reading the Rome 2 trace.
 //  - log / ini: rome2_stability.log / rome2_stability.ini next to this dll. address_space_trace is ON by default in a new ini (first runs: we need data).
-// Runs next to a dinput8.dll performance mod (a different file name, no conflict).
+// Runs inside the project's dinput8.dll performance mod.
 // ---------------------------------------------------------------- how it works (short)
 // Problem: the 32-bit game has about 4 GB of address space. After several battles the free space is cut into small pieces. A new battle needs one big
 // contiguous piece (tens of MB), finds none and crashes. Words used below: "piece" = a contiguous block of free address space; "reserve" = address
 // space that is set aside but not committed (it uses no real RAM).
 // What this DLL does:
-//  1. It sits in the game folder as version.dll, so Windows loads it instead of the real one. Every call is forwarded (see the end of the file).
-//  2. In DllMain it patches five ntdll functions (allocate, free, map view, unmap view ...), so the game's memory calls go through our hooks first.
+//  1. It is part of the existing dinput8.dll proxy; DirectInput exports continue to be forwarded by proxy.c.
+//  2. During dinput8.dll initialization it patches five ntdll functions (allocate, free, map view, unmap view ...), so the game's memory calls go through our hooks first.
 //  3. The hooks keep big pieces together: big blocks go to the top of the address space, big blocks the game frees are parked for its next big
 //     request, and a 192 MB reserve is handed back only when the game would otherwise fail.
 //  4. The NVIDIA driver's shader cache file is kept small (emptied at every start, over-sized views refused).
 //  5. A background thread (monitor) writes rome2_stability.log: free space, largest free piece, rescues, warnings.
-// Reading order: DllMain (end of file) -> core_ntava / core_ntfvm -> hk_ntmvs -> monitor.
+// Reading order: stability_init (end of file) -> core_ntava / core_ntfvm -> hk_ntmvs -> monitor.
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -157,7 +156,7 @@ static LONG NTAPI core_ntava(HANDLE ph, PVOID *base, ULONG_PTR zb, PSIZE_T size,
     }
     return st;
 }
-// every failed mapped view of this process, in full (logged later by the monitor / at the first version.dll call / at exit - no logging in the hook)
+// every failed mapped view of this process, in full (logged later by the monitor / on the first DirectInput call / at exit - no logging in the hook)
 // 1.3 (ChatGPT 03:37): STATUS_CONFLICTING_ADDRESSES with a wanted address -> what overlaps the wanted range: OUR parked piece(s) / OUR reserve
 // (then only those given back, ONE retry) or something else (nothing touched, the caller's own fallback). STATUS_NO_MEMORY without an address ->
 // parked pieces / reserve given back only when the view is 256 MB or less AND no compatible free piece is big enough (NVIDIA's 2 GB view: never).
@@ -691,7 +690,7 @@ static void dg_minute(void) {   // once a minute: the 10 largest free pieces + w
 }
 
 
-// ---------------------------------------------------------------- monitor thread (started at the first version.dll call)
+// ---------------------------------------------------------------- monitor thread (started on the first DirectInput call)
 // Background thread, loops every second: print what the hooks recorded, take the reserve again 20 s after it was given back, scan the address
 // space, and write the 'memory:' line once a minute (with a WARNING if the largest free piece is under 100 MB).
 static DWORD WINAPI monitor(LPVOID a) {
@@ -723,46 +722,14 @@ static DWORD WINAPI monitor(LPVOID a) {
     return 0;
 }
 
-// ---------------------------------------------------------------- version.dll pass-through
-// 17 exports, all passed to the real version.dll in the system folder. Every export first jumps through a trampoline that runs the one-time start-up
-// (vi_start) and then jumps to the real function with the caller's stack untouched (stdcall: arguments stay where they are; the start-up is a cdecl
-// call that only clobbers eax / ecx / edx). The last number is the stdcall argument bytes, used only by the fallback (real function not found: return 0).
-#define VI_LIST(X) \
-    X(0,  "GetFileVersionInfoA",       16) X(1,  "GetFileVersionInfoByHandle", 20) X(2,  "GetFileVersionInfoExA",  20) X(3,  "GetFileVersionInfoExW",  20) \
-    X(4,  "GetFileVersionInfoSizeA",    8) X(5,  "GetFileVersionInfoSizeExA",  12) X(6,  "GetFileVersionInfoSizeExW", 12) X(7,  "GetFileVersionInfoSizeW", 8) \
-    X(8,  "GetFileVersionInfoW",       16) X(9,  "VerFindFileA",               32) X(10, "VerFindFileW",           32) X(11, "VerInstallFileA",         32) \
-    X(12, "VerInstallFileW",           32) X(13, "VerLanguageNameA",           12) X(14, "VerLanguageNameW",       12) X(15, "VerQueryValueA",          16) \
-    X(16, "VerQueryValueW",            16)
-#define VI_N 17
-static HMODULE g_x; static volatile LONG g_vi_state;   // 0 not started, 1 starting, 2 done
-static void vi_start(int idx);
-static void (*const p_vi_start)(int) = vi_start;
-#define VI_PROTO(n, nm, b) static void lz_##n(void); static void fb_##n(void);
-VI_LIST(VI_PROTO)
-#define VI_LZ(n, nm, b) (void *)lz_##n,
-#define VI_FB(n, nm, b) (void *)fb_##n,
-#define VI_NM(n, nm, b) nm,
-static void *p_fn[VI_N] = { VI_LIST(VI_LZ) };            // until the first call: the trampolines; afterwards the real functions
-static void *const k_fb[VI_N] = { VI_LIST(VI_FB) };
-static const char *const k_nm[VI_N] = { VI_LIST(VI_NM) };
-#define VI_DEF(n, nm, b) \
-    __attribute__((naked)) static void fb_##n(void) { __asm__ volatile("xorl %%eax, %%eax\n\tret %0" :: "i"(b)); } \
-    __attribute__((naked)) static void lz_##n(void) { __asm__ volatile("pushl %0\n\tcall *%1\n\taddl $4, %%esp\n\tjmp *%2" :: "i"(n), "m"(p_vi_start), "m"(p_fn[n])); } \
-    __attribute__((naked)) void stub_##n(void) { __asm__ volatile("jmp *%0" :: "m"(p_fn[n])); }
-VI_LIST(VI_DEF)
-static void vi_start(int idx) {   // the first version.dll call (after DllMain): the real version.dll and the monitor thread
-    if (g_vi_state == 2) return;
-    if (InterlockedCompareExchange(&g_vi_state, 1, 0) != 0) { while (g_vi_state != 2) Sleep(1); return; }
-    wchar_t p[MAX_PATH]; GetSystemDirectoryW(p, MAX_PATH); wcscat(p, L"\\version.dll");
-    g_x = LoadLibraryW(p);
-    int miss = 0;
-    for (int i = 0; i < VI_N; i++) { void *f = g_x ? (void *)GetProcAddress(g_x, k_nm[i]) : NULL; if (!f) miss++; p_fn[i] = f ? f : k_fb[i]; }
-    MemoryBarrier(); InterlockedExchange(&g_vi_state, 2);
-    logf_("first version.dll call (%s) at +%lu ms after load - the real version.dll %s; %d of %d exports missing in it; monitor started", k_nm[idx], (unsigned long)(GetTickCount() - g_t0),
-          g_x ? "passed through" : "NOT FOUND in the system folder", miss, VI_N);
-    HANDLE th = CreateThread(NULL, 0, monitor, NULL, 0, NULL); if (th) CloseHandle(th);
+// ---------------------------------------------------------------- monitor start (outside DllMain, on first DirectInput call)
+static volatile LONG g_monitor_started;
+void stability_monitor_start(void) {
+    if (InterlockedCompareExchange(&g_monitor_started, 1, 0) != 0) return;
+    HANDLE th = CreateThread(NULL, 0, monitor, NULL, 0, NULL);
+    if (th) { CloseHandle(th); logf_("monitor started on first DirectInput call"); }
+    else { InterlockedExchange(&g_monitor_started, 0); logf_("monitor thread could not be started (error %lu)", GetLastError()); }
 }
-
 // ---------------------------------------------------------------- start
 // Create the ini file with the default settings if it does not exist yet.
 static void ini_defaults(void) {
@@ -791,14 +758,13 @@ static void ini_defaults(void) {
     HANDLE h = CreateFileW(g_ini, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
     if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, t, (DWORD)strlen(t), &w, NULL); CloseHandle(h); }
 }
-// Runs when the game loads this DLL: set up log and settings, install the 5 hooks (only if address_reserve_mb > 0), take the reserve.
+// Called from proxy.c when the game loads dinput8.dll: set up log and settings, install the 5 hooks (only if address_reserve_mb > 0), take the reserve.
 // Keep it light: no thread, no LoadLibrary (Windows holds the loader lock here).
-BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
-    (void)r;
-    if (reason == DLL_PROCESS_DETACH) { if (g_logok) mapfail_log(); return TRUE; }   // failed views recorded but not yet written (no version.dll call)
-    if (reason != DLL_PROCESS_ATTACH) return TRUE;
+void stability_detach(void) { if (g_logok) mapfail_log(); }
+
+void stability_init(HINSTANCE h) {
     // 1.2: no LoadLibrary, no thread, no file scans here - only kernel32 / ntdll calls of already loaded modules
-    DisableThreadLibraryCalls(h); g_t0 = GetTickCount();
+    g_t0 = GetTickCount();
     InitializeCriticalSection(&g_logcs);
     GetModuleFileNameW(h, g_dir, MAX_PATH); { wchar_t *sl = wcsrchr(g_dir, L'\\'); if (sl) sl[1] = 0; }
     wcscpy(g_logp, g_dir); wcscat(g_logp, L"rome2_stability.log");
@@ -810,7 +776,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
         HANDLE lh = CreateFileW(g_logp, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, 0, NULL);
         if (lh != INVALID_HANDLE_VALUE) { CloseHandle(lh); g_logok = 1; } }
     { SYSTEMTIME st; GetLocalTime(&st); logf_("---------- new session %04d-%02d-%02d ----------", st.wYear, st.wMonth, st.wDay); }   // the lines below only carry the time of day
-    logf_("Rome 2 Stability Fix %s loaded (version.dll)", VER);
+    logf_("Rome 2 Stability Fix %s loaded (dinput8.dll)", VER);
     ini_defaults();
     g_rsv_mb = (int)GetPrivateProfileIntW(L"stability", L"address_reserve_mb", 192, g_ini); if (g_rsv_mb < 0 || g_rsv_mb > 512) g_rsv_mb = 192;
     g_rsv_td = GetPrivateProfileIntW(L"stability", L"large_top_down", 1, g_ini) != 0;
@@ -839,5 +805,4 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
               (o_ntava && g_rsv_td) ? "on" : "off", (o_ntava && g_pk_on) ? "on" : "off", o_ntmvs ? "watched and logged in full" : "not watched");
         if (o_ntava) rsv_take();
     } else logf_("address reserve off (address_reserve_mb=0) - no hooks");
-    return TRUE;
 }

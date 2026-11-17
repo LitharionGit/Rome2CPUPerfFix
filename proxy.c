@@ -11,6 +11,10 @@
 #include "version.h"
 #include "logtrim.h"
 
+void stability_init(HINSTANCE h);
+void stability_monitor_start(void);
+void stability_detach(void);
+
 int install_tilescan(HMODULE m, int mode, int fpslog, void (*log)(const char *fmt, ...));  // tilescan.c
 extern void (*g_frame_check)(void);                                                    // tilescan.c
 int install_memwatch(HMODULE m, void (*trim)(void), void (*log)(const char *fmt, ...));  // memwatch.c
@@ -103,6 +107,7 @@ static FARPROC real_proc(const char *name) {
 
 void (*g_dev_di8_created)(void *di);   // the DLSS add-on's F11 panel filters the game's mouse while open (fgpanel.c)
 HRESULT WINAPI stub_DirectInput8Create(HINSTANCE h, DWORD v, REFIID r, LPVOID *o, LPUNKNOWN u) {
+    stability_monitor_start();
     typedef HRESULT(WINAPI * fn)(HINSTANCE, DWORD, REFIID, LPVOID *, LPUNKNOWN);
     fn f = (fn)real_proc("DirectInput8Create");
     if (f && g_dev_di8_created) {
@@ -365,11 +370,13 @@ static int wait_for_game(void) {
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     (void)r;
+    if (reason == DLL_PROCESS_DETACH) { stability_detach(); return TRUE; }
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
 #ifndef PROFILING
     DisableThreadLibraryCalls(h);  // profiling builds decide in install_all (the heap test needs thread notifications)
 #endif
     g_self = h;
+    stability_init(h);
     DWORD n = GetModuleFileNameW(h, g_log_path, MAX_PATH);
     wchar_t *sl = wcsrchr(g_log_path, L'\\');
     // room after the folder for the longest name built in it ("FrameBridge\settings.txt"); else no log path: do nothing
